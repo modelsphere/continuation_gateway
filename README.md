@@ -26,5 +26,6 @@ DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODELS=<Kimi-K3 的 mod
     python -m continuation_gateway.server
 ```
 
-可选环境变量（默认值见 `continuation_gateway/config.py`）：`TOKENIZE_URL`、`PORT`、
-`STALL_IDLE_TIMEOUT_SECONDS`、`CONNECT_TIMEOUT_SECONDS`、`MAX_CONTINUATION_BODY_MB`。
+可选环境变量（默认值见 `continuation_gateway/config.py`）：`PORT`、
+`STALL_IDLE_TIMEOUT_SECONDS`、`CONNECT_TIMEOUT_SECONDS`、`MAX_CONTINUATION_BODY_MB`、
+`CJK_CHARS_PER_TOKEN`、`OTHER_CHARS_PER_TOKEN`。

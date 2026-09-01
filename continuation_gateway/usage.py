@@ -3,17 +3,21 @@
 崩溃的那条腿由于连接中断，永远不会上报 usage；续写这条腿自己的 usage 是"这条腿单独生成了
 多少"，不包含被崩溃吞掉、又靠续写救回来的那部分内容——如果直接把续写腿的 usage 转发给客户端，
 会看到 completion_tokens 异常小、看起来像是内容丢了。这里的公式只做加法，不追求绝对精确：
-`corrected_prompt_tokens` 用 /v1/tokenize 的 messages 模式重新测一次原始请求（走跟
-/v1/chat/completions 相同的 chat_template 渲染），`corrected_completion/reasoning_tokens`
-= 续写腿真实上报的值 + 被救回的 reasoning/content 文本单独测出来的 token 数。
+`corrected_prompt_tokens`/`corrected_completion/reasoning_tokens` 里"被救回的那部分"用字符数
+估算出 token 数，加到续写腿真实上报的 usage 上。
 
-已知阻塞项：Kimi-K3 部署上 /v1/tokenize 的 messages 模式目前返回 500（疑似 SGLang bug，
-待确认 traceback），这条链路打通前，measure_recovered_tokens 会抛异常，调用方（server.py 的
-attempt_continuation）会捕获并降级——续写照常进行、只是不做 max_tokens 精确扣减和 usage
-修正，不能让一个 usage 统计的 bug 挡住给客户端的正文内容恢复。
+token 数不再靠 /v1/tokenize 现测（下游不想为这个改服务，且 messages 模式在 Kimi-K3 部署上
+一直有已知问题），改成 estimate_tokens() 按字符数估算：CJK（中/日/韩）字符和其它字符分开算，
+用两个经验比例（见 config.py 的 CJK_CHARS_PER_TOKEN / OTHER_CHARS_PER_TOKEN）换算成 token 数。
+这两个比例是通用经验值，不是针对 Kimi-K3 分词器实测校准过的，估算注定比真实分词有偏差——
+但这层本来就"只做加法、不追求绝对精确"，偏差是可接受的。
 """
 
 import json
+import math
+import re
+
+_CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힣豈-﫿]")
 
 
 class RecoveredTokens:
@@ -29,39 +33,52 @@ class RecoveredTokens:
         return self.reasoning_tokens + self.content_tokens
 
 
-async def _tokenize(session, tokenize_url: str, body: dict) -> int:
-    async with session.post(f"{tokenize_url}/v1/tokenize", json=body) as resp:
-        resp.raise_for_status()
-        data = await resp.json()
-    return data["count"]
-
-
-async def tokenize_messages(session, tokenize_url: str, original_payload: dict, model: str) -> int:
-    body = {"model": model, "messages": original_payload["messages"]}
-    for key in ("tools", "tool_choice", "chat_template_kwargs"):
-        if key in original_payload:
-            body[key] = original_payload[key]
-    return await _tokenize(session, tokenize_url, body)
-
-
-async def tokenize_text(session, tokenize_url: str, text: str, model: str) -> int:
+def estimate_tokens(text: str, cjk_chars_per_token: float, other_chars_per_token: float) -> int:
+    """按字符数估算 token 数。CJK 字符在大多数 BPE 分词器里比其它语言编码得密得多，混在一起
+    按同一个比例算误差会很大，所以分开数、分开换算再相加。"""
     if not text:
         return 0
-    # add_special_tokens=false：Kimi-K3 的 tokenizer 只有在零 kwargs 调用时才走它自己干净的
-    # 自定义编码路径（不额外加 BOS/EOS），这正是真实续写把 assistant 前缀拼进 prompt 时的
-    # 编码方式；/v1/tokenize 的实现只要传了 add_special_tokens（不管真假）就会改走标准 HF
-    # 通用兜底路径，行为不完全等价。传 false 至少能保证不会比真实续写多算出一个 BOS，是能做到
-    # 的最小偏差版本。
-    body = {"model": model, "prompt": text, "add_special_tokens": False}
-    return await _tokenize(session, tokenize_url, body)
+    cjk_chars = len(_CJK_RE.findall(text))
+    other_chars = len(text) - cjk_chars
+    return math.ceil(cjk_chars / cjk_chars_per_token + other_chars / other_chars_per_token)
 
 
-async def measure_recovered_tokens(session, tokenize_url: str, original_payload: dict,
-                                    reasoning_text: str, content_text: str) -> RecoveredTokens:
-    model = original_payload.get("model", "llm")
-    prompt_tokens = await tokenize_messages(session, tokenize_url, original_payload, model)
-    reasoning_tokens = await tokenize_text(session, tokenize_url, reasoning_text, model)
-    content_tokens = await tokenize_text(session, tokenize_url, content_text, model)
+def _message_text(message: dict) -> str:
+    parts = []
+    content = message.get("content")
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        # 多模态 content-parts 格式：只收文本部分，image_url 之类的不参与估算（本来就没有
+        # 直接对应的字符数可数，这类大 body 请求也基本会被 MAX_CONTINUATION_BODY_MB 挡在
+        # 续写范畴外）。
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(part.get("text", ""))
+    for tool_call in message.get("tool_calls") or []:
+        function = tool_call.get("function") or {}
+        parts.append(function.get("name", ""))
+        parts.append(function.get("arguments", ""))
+    return "".join(parts)
+
+
+def _prompt_text(payload: dict) -> str:
+    """把原始请求里跟 prompt token 数相关的文本拼成一整段——messages 的正文/tool_calls 参数，
+    加上 tools 的 schema（agent 场景里 tools 定义本身往往占不小的 token 量，不能漏）。不追求
+    跟 chat_template 渲染出来的文本逐字节一致（role 分隔符之类的控制 token 数量小，这里索性
+    忽略，跟"按字符估算"本身的精度取舍一致），只把实际内容的字符量尽量收全。"""
+    texts = [_message_text(m) for m in payload.get("messages", [])]
+    tools = payload.get("tools")
+    if tools:
+        texts.append(json.dumps(tools, ensure_ascii=False))
+    return "".join(texts)
+
+
+def estimate_recovered_tokens(original_payload: dict, reasoning_text: str, content_text: str,
+                               cjk_chars_per_token: float, other_chars_per_token: float) -> RecoveredTokens:
+    prompt_tokens = estimate_tokens(_prompt_text(original_payload), cjk_chars_per_token, other_chars_per_token)
+    reasoning_tokens = estimate_tokens(reasoning_text, cjk_chars_per_token, other_chars_per_token)
+    content_tokens = estimate_tokens(content_text, cjk_chars_per_token, other_chars_per_token)
     return RecoveredTokens(prompt_tokens, reasoning_tokens, content_tokens)
 
 
@@ -92,11 +109,9 @@ def correct_usage(recovered: RecoveredTokens, final_leg_usage: dict) -> dict:
     return corrected
 
 
-def rewrite_usage_line(line: bytes, recovered) -> bytes:
-    """续写腿逐行转发时用：其余行原样透传，只有带 usage 的那条 data 行原地替换成修正后的值。
-    recovered 为 None（tokenize 失败降级）时不做任何修改，原样透传最后一条腿的真实 usage。
-    """
-    if recovered is None or not line.startswith(b"data:"):
+def rewrite_usage_line(line: bytes, recovered: RecoveredTokens) -> bytes:
+    """续写腿逐行转发时用：其余行原样透传，只有带 usage 的那条 data 行原地替换成修正后的值。"""
+    if not line.startswith(b"data:"):
         return line
     data = line[len(b"data:"):].strip()
     if data in (b"[DONE]", b""):

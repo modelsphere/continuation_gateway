@@ -20,11 +20,9 @@ thinking-partial）。两类场景明确排除，都在 `should_intervene()`/`st
     DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODELS=<Kimi-K3 的 model 名字> \\
         python -m continuation_gateway.server
 
-还没法接实机验证，原因两条：
-    1) 测试集群还没准备好；
-    2) /v1/tokenize 的 messages 模式在 Kimi-K3 部署上目前返回 500（疑似 SGLang bug，待确认
-       traceback）——这条链路打通前，usage 修正和 max_tokens 精确扣减会自动降级（见
-       usage.py 顶部注释），不会因此打断给客户端的正文内容恢复。
+usage 修正 / max_tokens 扣减用到的 token 数不是靠 /v1/tokenize 现测的（下游不想为这个改
+服务，且 messages 模式在 Kimi-K3 部署上一直有已知问题），是按字符数估算的，见 usage.py
+顶部注释。
 """
 
 import asyncio
@@ -45,7 +43,7 @@ from aiohttp import (
 from . import config
 from .reconstruct import build_prefix, needs_thinking_disabled
 from .sse import LineSplitter, StreamState, feed_line
-from .usage import measure_recovered_tokens, rewrite_usage_line
+from .usage import estimate_recovered_tokens, rewrite_usage_line
 
 if not config.DOWNSTREAM_URL:
     sys.exit("Set DOWNSTREAM_URL, e.g. DOWNSTREAM_URL=http://172.26.3.82:8050 "
@@ -81,7 +79,8 @@ def should_intervene(payload: dict, body_size: int) -> bool:
         # 的流式响应"这个前提不符；而且 usage 修正公式假设"恰好两条腿"，如果在客户端自己的
         # 续写之上再续一次，没法可靠知道客户端那次续写已经消耗了多少 token，会破坏公式。
         return False
-    if not config.CONTINUATION_MODELS or payload.get("model") not in config.CONTINUATION_MODELS:
+    model = (payload.get("model") or "").lower()
+    if not config.CONTINUATION_MODELS or model not in config.CONTINUATION_MODELS:
         return False
     if (payload.get("response_format") or {}).get("type") in ("json_object", "json_schema"):
         # 结构化输出（json_object/json_schema）不进续写，且不打算靠改 SGLang 支持——这条跟
@@ -202,13 +201,8 @@ async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: Line
 
 async def attempt_continuation(session: ClientSession, target: str, headers: dict, original_payload: dict,
                                 state: StreamState, out: web.StreamResponse) -> None:
-    recovered = None
-    try:
-        recovered = await measure_recovered_tokens(session, config.TOKENIZE_URL, original_payload,
-                                                     state.reasoning, state.content)
-    except Exception:
-        log.exception("tokenize measurement failed (known Kimi-K3 /v1/tokenize issue?) — "
-                       "continuation proceeds without max_tokens deduction / usage correction: %s", target)
+    recovered = estimate_recovered_tokens(original_payload, state.reasoning, state.content,
+                                           config.CJK_CHARS_PER_TOKEN, config.OTHER_CHARS_PER_TOKEN)
 
     # 客户端原始请求用的是 max_tokens 还是 max_completion_tokens（新旧两个字段，语义等价），
     # 续写请求就沿用同一个字段名去扣减，不额外发明一个默认预算：客户端两个都没传，意思就是
@@ -216,7 +210,7 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
     # （不常见），两个都按扣减后的值改，避免下游到底读哪个字段产生歧义。
     budget_fields = [f for f in ("max_tokens", "max_completion_tokens") if original_payload.get(f) is not None]
 
-    prefix = build_prefix(state.reasoning, state.content)
+    prefix = build_prefix(original_payload.get("model"), state.reasoning, state.content)
     continuation_payload = dict(original_payload)
     continuation_payload["messages"] = list(original_payload.get("messages", [])) + [
         {"role": "assistant", "content": prefix}
@@ -224,14 +218,10 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
 
     if budget_fields:
         original_budget = original_payload[budget_fields[0]]
-        if recovered is not None:
-            remaining_budget = original_budget - recovered.total_recovered
-            if remaining_budget <= 0:
-                log.info("max_tokens budget exhausted before continuation, not retrying: %s", target)
-                return
-        else:
-            # 降级：拿不到已恢复 token 数就不扣减，接受"最多翻倍"的预算风险（只续一次，风险有界）。
-            remaining_budget = original_budget
+        remaining_budget = original_budget - recovered.total_recovered
+        if remaining_budget <= 0:
+            log.info("max_tokens budget exhausted before continuation, not retrying: %s", target)
+            return
         for field in budget_fields:
             continuation_payload[field] = remaining_budget
     # else: 客户端原始请求没有限制 token 数，续写请求也不设——不无中生有一个默认预算。
@@ -336,12 +326,10 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
             except Exception:
                 # 这是网关层，这里再崩会把已经转发给客户端的部分也带没了、甚至可能影响到
                 # 同一个 worker 上别的请求；续写本身是"锦上添花"，救不回来不该拖累已经稳妥
-                # 转发出去的正文。这里兜的是"意料之外"的错误——tokenize 失败已经在
-                # attempt_continuation 内部单独兜过、会降级但不放弃续写，这层是防那些没有
-                # 专门处理过的异常（比如构造续写 payload 时的意外类型错误、客户端在续写腿
-                # 写入过程中断开连接）。不用担心吞掉 asyncio.CancelledError——Python 3.8+
-                # 它是 BaseException 的子类，不会被 `except Exception` 捕获，正常取消/关闭
-                # 流程不受影响。
+                # 转发出去的正文。这里兜的是"意料之外"的错误（比如构造续写 payload 时的
+                # 意外类型错误、客户端在续写腿写入过程中断开连接）。不用担心吞掉
+                # asyncio.CancelledError——Python 3.8+ 它是 BaseException 的子类，不会被
+                # `except Exception` 捕获，正常取消/关闭流程不受影响。
                 log.exception("continuation attempt crashed unexpectedly, ending stream as-is: %s",
                                target)
         # else: 收到过 chunk 但没有任何可用的 reasoning/content（比如只有一个空白的角色
