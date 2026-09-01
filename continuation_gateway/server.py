@@ -29,6 +29,7 @@ import asyncio
 import json
 import logging
 import sys
+import time
 
 from aiohttp import (
     ClientConnectionError,
@@ -62,6 +63,9 @@ HOP_BY_HOP = {
 # 没能正常说完就断了"，具体见 timed_reads/relay 的处理——不区分对待。
 DISCONNECT_ERRORS = (ClientPayloadError, ConnectionResetError, ServerDisconnectedError, ClientConnectionError)
 
+# 日志统一用北京时间（UTC+8，没有夏令时，固定偏移就够）——部署容器的系统时区通常是 UTC，
+# 不改的话日志时间戳跟实际发生时间对不上，排查问题时得手动加 8 小时。
+logging.Formatter.converter = lambda *args: time.gmtime(time.time() + 8 * 3600)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("continuation_gateway")
 
@@ -106,20 +110,25 @@ def should_intervene(payload: dict, body_size: int) -> bool:
     return True
 
 
-async def timed_reads(content, idle_timeout: float):
+async def timed_reads(content, idle_timeout: float, stall_reason: list):
     """收到过至少一个 chunk 之后才会被用到（见 relay()/relay_leg2() 里第一个 chunk 的单独
     处理）：用 idle_timeout 逐块 yield 原始字节，超时/断连时直接 return（不抛异常）。调用方
     靠"有没有见过 finish_reason"判断是否需要续写，不需要区分具体是超时、断连、还是干净 EOF
-    导致的循环结束——这三种情况的后续处理完全一样。
+    导致的循环结束——这三种情况的后续处理完全一样，只是把具体原因写进 stall_reason（长度
+    0 或 1 的 list，用来在生成器提前 return 时把"为什么停"带回调用方打日志用——async
+    generator 没法像普通 generator 那样通过 StopIteration.value 带返回值）。
     """
     while True:
         try:
             chunk = await asyncio.wait_for(content.readany(), timeout=idle_timeout)
         except asyncio.TimeoutError:
+            stall_reason.append(f"idle timeout after {idle_timeout}s")
             return
-        except DISCONNECT_ERRORS:
+        except DISCONNECT_ERRORS as e:
+            stall_reason.append(f"downstream disconnected ({type(e).__name__})")
             return
         if not chunk:
+            stall_reason.append("clean EOF")
             return
         yield chunk
 
@@ -157,52 +166,60 @@ async def passthrough(request: web.Request, raw_body: bytes = None) -> web.Strea
 
 
 async def relay(downstream_content, out: web.StreamResponse, state: StreamState,
-                 splitter: LineSplitter) -> bool:
+                 splitter: LineSplitter) -> tuple:
     """原始腿：先无限等第一个 chunk——这一层不对"迟迟没有第一个 chunk"这件事负责，等多久、
     要不要重试是上层的事；这期间发生的连接异常也不吞，直接往上抛，让这次请求按普通失败处理，
     不进入续写逻辑（客户端还没看到任何内容，没什么好"救"的）。收到第一个 chunk 之后才开始
     用 idle timeout 盯"卡住"这件事，字节原样转发给客户端（不改写任何内容），同一份字节喂
-    SSE 行解析更新 state。返回 True 表示这条腿结束时已经转发过至少一个 chunk、但还没见过
-    finish_reason——不管是超时、断连、还是干净 EOF，都算"没说完"，调用方据此决定要不要续写；
-    第一个 chunk 就干净 EOF（downstream 一个字节都没吐）时返回 False，不算需要续写。
+    SSE 行解析更新 state。返回 (needs_retry, stall_reason)：needs_retry 为 True 表示这条腿
+    结束时已经转发过至少一个 chunk、但还没见过 finish_reason——不管是超时、断连、还是干净
+    EOF，都算"没说完"，调用方据此决定要不要续写；第一个 chunk 就干净 EOF（downstream 一个
+    字节都没吐）时 needs_retry 为 False，不算需要续写，此时 stall_reason 是 None。
     """
     chunk = await downstream_content.readany()
     if not chunk:
-        return False
+        return False, None
     await out.write(chunk)
     for line in splitter.feed(chunk):
         feed_line(line, state)
 
-    async for chunk in timed_reads(downstream_content, config.STALL_IDLE_TIMEOUT_SECONDS):
+    stall_reason = []
+    async for chunk in timed_reads(downstream_content, config.STALL_IDLE_TIMEOUT_SECONDS, stall_reason):
         await out.write(chunk)
         for line in splitter.feed(chunk):
             feed_line(line, state)
-    return state.finish_reason is None
+    return state.finish_reason is None, stall_reason[0]
 
 
-async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: LineSplitter, recovered) -> None:
+async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: LineSplitter, recovered) -> str:
     """续写腿：逐行转发（不是整块字节透传），因为带 usage 的那条 data 行要原地改写。同样先
     无限等第一个 chunk 再开始用 idle timeout；单次续写策略下，这条腿不管怎么失败（第一个
     chunk 就断、还是后面卡住/断线），都不再发第三条腿，直接安静结束，让调用方把流正常收尾。
+    返回值是这条腿结束的原因，纯粹给调用方打日志用，不影响"不发第三条腿"这个既定行为。
     """
     try:
         chunk = await downstream_content.readany()
-    except DISCONNECT_ERRORS:
-        return
+    except DISCONNECT_ERRORS as e:
+        return f"downstream disconnected before first chunk ({type(e).__name__})"
     if not chunk:
-        return
+        return "clean EOF before first chunk"
     for line in splitter.feed(chunk):
         await out.write(rewrite_usage_line(line, recovered) + b"\n")
 
-    async for chunk in timed_reads(downstream_content, config.STALL_IDLE_TIMEOUT_SECONDS):
+    stall_reason = []
+    async for chunk in timed_reads(downstream_content, config.STALL_IDLE_TIMEOUT_SECONDS, stall_reason):
         for line in splitter.feed(chunk):
             await out.write(rewrite_usage_line(line, recovered) + b"\n")
+    return stall_reason[0]
 
 
 async def attempt_continuation(session: ClientSession, target: str, headers: dict, original_payload: dict,
                                 state: StreamState, out: web.StreamResponse) -> None:
     recovered = estimate_recovered_tokens(original_payload, state.reasoning, state.content,
                                            config.CJK_CHARS_PER_TOKEN, config.OTHER_CHARS_PER_TOKEN)
+    log.info("continuation token estimate: prompt=%d reasoning=%d content=%d total_recovered=%d: %s",
+              recovered.prompt_tokens, recovered.reasoning_tokens, recovered.content_tokens,
+              recovered.total_recovered, target)
 
     # 客户端原始请求用的是 max_tokens 还是 max_completion_tokens（新旧两个字段，语义等价），
     # 续写请求就沿用同一个字段名去扣减，不额外发明一个默认预算：客户端两个都没传，意思就是
@@ -222,6 +239,7 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
         if remaining_budget <= 0:
             log.info("max_tokens budget exhausted before continuation, not retrying: %s", target)
             return
+        log.info("continuation budget: original=%d remaining=%d: %s", original_budget, remaining_budget, target)
         for field in budget_fields:
             continuation_payload[field] = remaining_budget
     # else: 客户端原始请求没有限制 token 数，续写请求也不设——不无中生有一个默认预算。
@@ -247,9 +265,10 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
 
     splitter = LineSplitter()
     try:
-        await relay_leg2(downstream.content, out, splitter, recovered)
+        leg2_outcome = await relay_leg2(downstream.content, out, splitter, recovered)
     finally:
         downstream.release()
+    log.info("continuation leg ended: %s: %s", leg2_outcome, target)
 
 
 async def chat_completions(request: web.Request) -> web.StreamResponse:
@@ -299,7 +318,7 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
     state = StreamState()
     splitter = LineSplitter()
     try:
-        needs_retry = await relay(downstream.content, out, state, splitter)
+        needs_retry, stall_reason = await relay(downstream.content, out, state, splitter)
     except (*DISCONNECT_ERRORS, asyncio.CancelledError):
         # 这里同时兜两类情况，都不属于续写范畴、都不吞异常：(1) 下游连接出问题——第一个
         # chunk 都没等到、或者读到一半断了（relay() 内部读下游失败，DISCONNECT_ERRORS）；
@@ -317,6 +336,9 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
         downstream.release()
 
     if needs_retry:
+        log.info("stream ended without finish_reason (%s), reasoning=%d chars content=%d chars "
+                  "tool_calls_seen=%s: %s",
+                  stall_reason, len(state.reasoning), len(state.content), state.tool_calls_seen, target)
         if state.tool_calls_seen:
             # v1 范围排除：已经出现过 tool_call chunk，不在网关能安全处理的范围内，不救。
             log.warning("stall after tool_call chunk (out of v1 scope, not retrying): %s", target)
