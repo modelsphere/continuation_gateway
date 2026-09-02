@@ -26,6 +26,14 @@ CONNECT_TIMEOUT_SECONDS = float(os.environ.get("CONNECT_TIMEOUT_SECONDS", "30"))
 MAX_CONTINUATION_BODY_MB = int(os.environ.get("MAX_CONTINUATION_BODY_MB", "10"))
 MAX_CONTINUATION_BODY_BYTES = MAX_CONTINUATION_BODY_MB * 1024 * 1024
 
+# aiohttp 的 web.Application 默认 client_max_size 只有 1MB，比 MAX_CONTINUATION_BODY_MB
+# 本身还小——如果不显式覆盖，任何超过 1MB 的请求体（不管是不是续写模型、不管要不要触发续写）
+# 都会在业务代码跑起来之前就被 aiohttp 框架直接拒成 413，MAX_CONTINUATION_BODY_MB 这个"超限
+# 就纯透传"的设计会形同虚设。默认给到跟上游请求体上限（100MB，为兼容图片/视频放开的）一致，
+# 保证网关这一层不会比它上游更严格地拒绝合法请求。
+MAX_REQUEST_BODY_MB = int(os.environ.get("MAX_REQUEST_BODY_MB", "100"))
+MAX_REQUEST_BODY_BYTES = MAX_REQUEST_BODY_MB * 1024 * 1024
+
 # usage 修正 / max_tokens 扣减要用到的 token 数，不再靠 /v1/tokenize 现测（避免更改下游
 # SGLang服务），改成按字符数估算，见 usage.py
 # 的 estimate_tokens()。CJK（中/日/韩）字符和其它字符分开算，因为两者在大多数 BPE 分词器里

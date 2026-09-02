@@ -366,6 +366,19 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
     return out
 
 
+async def health(request: web.Request) -> web.Response:
+    """网关自己的存活探测——纯 liveness，不碰下游。
+
+    在 catch_all 之前单独注册这条路由，是为了把"网关进程本身活着"和"下游 SGLang 集群健不
+    健康"这两件事分开：如果 /health 也像其它未知路径一样落进 catch_all 透传给下游，探测到的
+    其实是下游状态——下游抖动/变慢时会把一个完全正常的网关进程也判定成不健康（被编排系统
+    误重启），下游health接口异常时也无法反映网关自身是否存在问题（比如事件循环被某个请求
+    卡住）却因为下游可达而看起来"健康"。能进到这个 handler 里跑起来并返回，本身就已经证明
+    事件循环没有被卡死——不需要再额外做什么检查。
+    """
+    return web.json_response({"status": "ok"})
+
+
 async def catch_all(request: web.Request) -> web.StreamResponse:
     return await passthrough(request)
 
@@ -382,10 +395,12 @@ async def on_cleanup(app: web.Application):
 
 
 def main():
-    app = web.Application()
+    app = web.Application(client_max_size=config.MAX_REQUEST_BODY_BYTES)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     app.router.add_post("/v1/chat/completions", chat_completions)
+    # /health 必须在 catch_all 的通配路由之前注册，否则会被 catch_all 透传到下游。
+    app.router.add_get("/health", health)
     app.router.add_route("*", "/{tail:.*}", catch_all)
     log.info("listening on 0.0.0.0:%d, forwarding to %s (continuation models: %s)",
               config.PORT, config.DOWNSTREAM_URL, config.CONTINUATION_MODELS or "<none configured>")

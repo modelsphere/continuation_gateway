@@ -28,4 +28,15 @@ DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODELS=<Kimi-K3 的 mod
 
 可选环境变量（默认值见 `continuation_gateway/config.py`）：`PORT`、
 `STALL_IDLE_TIMEOUT_SECONDS`、`CONNECT_TIMEOUT_SECONDS`、`MAX_CONTINUATION_BODY_MB`、
-`CJK_CHARS_PER_TOKEN`、`OTHER_CHARS_PER_TOKEN`。
+`MAX_REQUEST_BODY_MB`、`CJK_CHARS_PER_TOKEN`、`OTHER_CHARS_PER_TOKEN`。
+
+## 测试
+
+`tests/smoke_test.py`：不连真实集群，起一个本地假 downstream（模拟 SGLang 的流式响应）+
+真的 `continuation_gateway` 服务，用真实 HTTP 请求验证网关自己的转发/编排逻辑（卡住/断连
+触发续写、tool_call/response_format/超限 body 等场景老实不救、usage 改写、按 model 分派的
+前缀重建）。不验证续写内容语义是否连贯——那部分要在真实集群上验证。
+
+```bash
+python tests/smoke_test.py
+```
