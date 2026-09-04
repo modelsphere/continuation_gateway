@@ -1,4 +1,4 @@
-FROM harbor-contest.4pd.io/luxinlong02/python:3.12-slim
+FROM harbor.4pd.io/sagegpt-aio/pk_platform/ubuntu_python:24.04_3.12
 
 WORKDIR /app
 
@@ -15,4 +15,4 @@ EXPOSE 8000
 # 可选：PORT（默认 8000）、STALL_IDLE_TIMEOUT_SECONDS、CONNECT_TIMEOUT_SECONDS、
 #      MAX_CONTINUATION_BODY_MB、CJK_CHARS_PER_TOKEN、OTHER_CHARS_PER_TOKEN
 #      （默认值见 config.py）。
-CMD ["python", "-m", "continuation_gateway.server"]
+CMD ["python3", "-m", "continuation_gateway.server"]
