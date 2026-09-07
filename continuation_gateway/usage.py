@@ -16,6 +16,7 @@ token 数不再靠 /v1/tokenize 现测（下游不想为这个改服务，且 me
 import json
 import math
 import re
+from typing import Optional
 
 _CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힣豈-﫿]")
 
@@ -109,8 +110,15 @@ def correct_usage(recovered: RecoveredTokens, final_leg_usage: dict) -> dict:
     return corrected
 
 
-def rewrite_usage_line(line: bytes, recovered: RecoveredTokens) -> bytes:
-    """续写腿逐行转发时用：其余行原样透传，只有带 usage 的那条 data 行原地替换成修正后的值。"""
+def rewrite_leg2_line(line: bytes, recovered: RecoveredTokens, response_id: Optional[str]) -> bytes:
+    """续写腿逐行转发时用：两件事都在这一行原地做——①带 usage 的那条 data 行替换成修正后
+    的值；②把 id 改写回 leg1 的原始 response_id。续写腿是网关自己发起的第二个下游请求，
+    下游会给它分配一个全新的 completion id，如果不改写，客户端会在同一个响应流里看到 id
+    中途变了（大多数 OpenAI 兼容客户端假设一个流式响应从头到尾只有一个 id，中途变化容易
+    被当成异常，也会让"客户端和网关日志对上是哪个请求"这件事失去一个本该天然存在的锚点）。
+    response_id 为 None（理论上不该发生，leg1 至少一个 chunk 才会走到续写）时不改写 id，
+    只做 usage 修正，其余字段原样透传。
+    """
     if not line.startswith(b"data:"):
         return line
     data = line[len(b"data:"):].strip()
@@ -120,7 +128,13 @@ def rewrite_usage_line(line: bytes, recovered: RecoveredTokens) -> bytes:
         obj = json.loads(data)
     except json.JSONDecodeError:
         return line
-    if not obj.get("usage"):
+    changed = False
+    if response_id and obj.get("id") and obj["id"] != response_id:
+        obj["id"] = response_id
+        changed = True
+    if obj.get("usage"):
+        obj["usage"] = correct_usage(recovered, obj["usage"])
+        changed = True
+    if not changed:
         return line
-    obj["usage"] = correct_usage(recovered, obj["usage"])
     return f"data: {json.dumps(obj, ensure_ascii=False)}".encode()

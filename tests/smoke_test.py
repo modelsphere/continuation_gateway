@@ -65,8 +65,11 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
 
     elif scenario == "content_done_stall":
         if call_n == 1:
-            await resp.write(sse({"choices": [{"delta": {"reasoning_content": "let me think. "}}]}))
-            await resp.write(sse({"choices": [{"delta": {"content": "The answer is par"}}]}))
+            # leg1 的 completion id——续写发生后客户端应该从头到尾只看到这一个 id，见下面
+            # call_n==2 分支里故意分配的不同 id，以及 call_gateway() 里对 ids 的断言。
+            await resp.write(sse({"id": "chatcmpl-leg1",
+                                   "choices": [{"delta": {"reasoning_content": "let me think. "}}]}))
+            await resp.write(sse({"id": "chatcmpl-leg1", "choices": [{"delta": {"content": "The answer is par"}}]}))
             await asyncio.sleep(5)  # 永远等不到下一个 chunk，触发 idle timeout
         else:
             assert body.get("continue_final_message") is True
@@ -76,9 +79,12 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
             expected_budget = 1000 - (est("let me think. ") + est("The answer is par"))
             assert body.get("max_tokens") == expected_budget, \
                 f"max_tokens={body.get('max_tokens')}, expected={expected_budget}"
-            await resp.write(sse({"choices": [{"delta": {"content": "tial recovery."}}]}))
-            await resp.write(sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
-            await resp.write(sse({"choices": [], "usage": {
+            # 故意跟 leg1 的 id 不一样——真实下游对续写请求（网关自己发起的新 HTTP 请求）会
+            # 分配一个全新的 completion id，网关必须把它改写回 leg1 的原始 id 再转发给客户端。
+            leg2_id = "chatcmpl-leg2-should-be-rewritten"
+            await resp.write(sse({"id": leg2_id, "choices": [{"delta": {"content": "tial recovery."}}]}))
+            await resp.write(sse({"id": leg2_id, "choices": [{"delta": {}, "finish_reason": "stop"}]}))
+            await resp.write(sse({"id": leg2_id, "choices": [], "usage": {
                 "prompt_tokens": 999, "completion_tokens": 3, "total_tokens": 1002, "reasoning_tokens": 0,
                 "prompt_tokens_details": {"cached_tokens": 5000},
             }}))
@@ -229,7 +235,7 @@ async def call_gateway(scenario: str, model: str = "test-model", extra: dict = N
         payload.pop(key, None)
     if extra:
         payload.update(extra)
-    reasoning, content, finish_reason, usage = [], [], None, None
+    reasoning, content, finish_reason, usage, ids = [], [], None, None, []
     aborted = False
     async with ClientSession(timeout=ClientTimeout(total=15)) as client:
         async with client.post(f"http://127.0.0.1:{GATEWAY_PORT}/v1/chat/completions",
@@ -244,6 +250,8 @@ async def call_gateway(scenario: str, model: str = "test-model", extra: dict = N
                     if data == "[DONE]":
                         break
                     obj = json.loads(data)
+                    if obj.get("id"):
+                        ids.append(obj["id"])
                     if obj.get("usage"):
                         usage = obj["usage"]
                     for ch in obj.get("choices", []):
@@ -259,7 +267,7 @@ async def call_gateway(scenario: str, model: str = "test-model", extra: dict = N
                 # 这正是 no_chunk_disconnect 场景要验证的行为，不是测试的 bug。
                 aborted = True
     return {"status": status, "reasoning": "".join(reasoning), "content": "".join(content),
-            "finish_reason": finish_reason, "usage": usage, "aborted": aborted}
+            "finish_reason": finish_reason, "usage": usage, "aborted": aborted, "ids": ids}
 
 
 async def main():
@@ -289,6 +297,11 @@ async def main():
               r["usage"]["completion_tokens"] == expected_completion, r["usage"])
         check("cached_tokens clamped to <= corrected prompt_tokens",
               r["usage"]["prompt_tokens_details"]["cached_tokens"] <= r["usage"]["prompt_tokens"], r["usage"])
+        # leg2 的 mock 下游把 id 换成了 "chatcmpl-leg2-should-be-rewritten"（模拟真实下游给
+        # 续写请求分配的新 completion id），网关必须把它改写回 leg1 的原始 id，客户端才不会
+        # 在同一个响应里看到 id 中途变化。
+        check("id stays the same across leg1/leg2 (rewritten back to leg1's original id)",
+              r["ids"] and all(i == "chatcmpl-leg1" for i in r["ids"]), r["ids"])
 
         print("\n== thinking_partial_disconnect (断连触发 + thinking 不能被关) ==")
         r = await call_gateway("thinking_partial_disconnect")
