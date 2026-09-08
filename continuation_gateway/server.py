@@ -165,7 +165,7 @@ async def passthrough(request: web.Request, raw_body: bytes = None) -> web.Strea
 
 
 async def relay(downstream_content, out: web.StreamResponse, state: StreamState,
-                 splitter: LineSplitter) -> tuple:
+                 splitter: LineSplitter, req_id: str) -> tuple:
     """原始腿：先无限等第一个 chunk——这一层不对"迟迟没有第一个 chunk"这件事负责，等多久、
     要不要重试是上层的事；这期间发生的连接异常也不吞，直接往上抛，让这次请求按普通失败处理，
     不进入续写逻辑（客户端还没看到任何内容，没什么好"救"的）。收到第一个 chunk 之后才开始
@@ -183,7 +183,10 @@ async def relay(downstream_content, out: web.StreamResponse, state: StreamState,
     返回 (needs_retry, stall_reason)：needs_retry 为 True 表示这条腿结束时已经转发过至少
     一个 chunk、但还没见过 finish_reason，调用方据此决定要不要续写；第一个 chunk 就干净
     EOF（downstream 一个字节都没吐）时 needs_retry 为 False，不算需要续写，此时 stall_reason
-    是 None。
+    是 None。`req_id` 用于每次 idle timeout 触发时打日志——不管这次超时最终是"继续等"还是
+    "交给上层决定要不要续写"，都统一在这里留一行标记，不是只有前者才值得记；这时候
+    `state.response_id` 大概率已经从第一个 chunk 里解析出来了，优先用它（跟客户端能看到的
+    completion id 对上号），解析不出来才退回用这个兜底 id。
     """
     chunk = await downstream_content.readany()
     if not chunk:
@@ -200,8 +203,19 @@ async def relay(downstream_content, out: web.StreamResponse, state: StreamState,
                 feed_line(line, state)
         reason = stall_reason[0]
         has_recoverable = not state.tool_calls_seen and (state.reasoning or state.content)
-        if reason.startswith("idle timeout") and not has_recoverable:
-            continue
+        if reason.startswith("idle timeout"):
+            log_id = state.response_id or req_id
+            if has_recoverable:
+                # 这次超时是"可以做点什么"的那种——留一行标记这个事件本身发生过，具体决定
+                # 续不续写由 guarded() 的 TRIGGERED 日志接着记，这里不重复那份细节。
+                log.info("[continuation req=%s] leg1 idle timeout (%s), handing off for "
+                         "continuation decision", log_id, reason)
+            else:
+                log.warning("[continuation req=%s] leg1 stalled (%s) but not actionable "
+                            "(tool_calls_seen=%s, has_content=%s), continuing to wait",
+                            log_id, reason, state.tool_calls_seen,
+                            bool(state.reasoning or state.content))
+                continue
         return state.finish_reason is None, reason
 
 
@@ -363,7 +377,7 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
     state = StreamState()
     splitter = LineSplitter()
     try:
-        needs_retry, stall_reason = await relay(downstream.content, out, state, splitter)
+        needs_retry, stall_reason = await relay(downstream.content, out, state, splitter, req_id)
     except (*DISCONNECT_ERRORS, asyncio.CancelledError):
         # 这里同时兜两类情况，都不属于续写范畴、都不吞异常：(1) 下游连接出问题——第一个
         # chunk 都没等到、或者读到一半断了（relay() 内部读下游失败，DISCONNECT_ERRORS）；
