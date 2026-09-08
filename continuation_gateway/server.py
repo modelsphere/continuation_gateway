@@ -12,8 +12,6 @@ thinking-partial）。两类场景明确排除，都在 `should_intervene()`/`st
   decoding 约束着的"再决定怎么重建前缀，复杂度不值得。这条从原始请求的 response_format
   字段就能直接判断，不用等流式过程中才发现，在 `should_intervene()` 里前置排除。
 
-不修改 proxy.py——这是独立的小项目，proxy.py 仍然是同事给的纯透明代理参考实现。
-
 跑法（下游预期是一个机房/集群路由网关，不是直连某个具体 SGLang 实例；原始请求和续写请求打
 同一个 URL，实例选择/避开故障实例交给下游网关负责，这一层不自己维护 SGLang 实例列表）：
 
@@ -172,10 +170,20 @@ async def relay(downstream_content, out: web.StreamResponse, state: StreamState,
     要不要重试是上层的事；这期间发生的连接异常也不吞，直接往上抛，让这次请求按普通失败处理，
     不进入续写逻辑（客户端还没看到任何内容，没什么好"救"的）。收到第一个 chunk 之后才开始
     用 idle timeout 盯"卡住"这件事，字节原样转发给客户端（不改写任何内容），同一份字节喂
-    SSE 行解析更新 state。返回 (needs_retry, stall_reason)：needs_retry 为 True 表示这条腿
-    结束时已经转发过至少一个 chunk、但还没见过 finish_reason——不管是超时、断连、还是干净
-    EOF，都算"没说完"，调用方据此决定要不要续写；第一个 chunk 就干净 EOF（downstream 一个
-    字节都没吐）时 needs_retry 为 False，不算需要续写，此时 stall_reason 是 None。
+    SSE 行解析更新 state。
+
+    idle timeout 本身不代表"该结束这条腿"——它只在"接下来有机会做一次有意义的续写"时才是
+    一个值得停下来的信号，也就是要同时满足：还没见过 tool_call、且已经攒到了可恢复的
+    reasoning/content。不满足这两条时（tool_call 已经出现，或者目前为止还什么实质内容都
+    没有），idle timeout 只是又白等了一轮，继续等——跟没有这层网关时下游只是慢一样，不应该
+    被这一层主动挂断，等下去仍然有机会等到内容。真正的断连/干净 EOF 不管当前是什么状态都会
+    结束这个循环，因为已经没有字节可读了，继续等没有意义，这个终点和没有网关时一致（普通
+    转发这时候也会结束）。
+
+    返回 (needs_retry, stall_reason)：needs_retry 为 True 表示这条腿结束时已经转发过至少
+    一个 chunk、但还没见过 finish_reason，调用方据此决定要不要续写；第一个 chunk 就干净
+    EOF（downstream 一个字节都没吐）时 needs_retry 为 False，不算需要续写，此时 stall_reason
+    是 None。
     """
     chunk = await downstream_content.readany()
     if not chunk:
@@ -184,25 +192,35 @@ async def relay(downstream_content, out: web.StreamResponse, state: StreamState,
     for line in splitter.feed(chunk):
         feed_line(line, state)
 
-    stall_reason = []
-    async for chunk in timed_reads(downstream_content, config.STALL_IDLE_TIMEOUT_SECONDS, stall_reason):
-        await out.write(chunk)
-        for line in splitter.feed(chunk):
-            feed_line(line, state)
-    return state.finish_reason is None, stall_reason[0]
+    while True:
+        stall_reason = []
+        async for chunk in timed_reads(downstream_content, config.STALL_IDLE_TIMEOUT_SECONDS, stall_reason):
+            await out.write(chunk)
+            for line in splitter.feed(chunk):
+                feed_line(line, state)
+        reason = stall_reason[0]
+        has_recoverable = not state.tool_calls_seen and (state.reasoning or state.content)
+        if reason.startswith("idle timeout") and not has_recoverable:
+            continue
+        return state.finish_reason is None, reason
 
 
 async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: LineSplitter, recovered,
-                      response_id: str) -> tuple:
+                      response_id: str, log_id: str) -> tuple:
     """续写腿：逐行转发（不是整块字节透传），因为带 usage 的那条 data 行、以及每一行的 id
     都要原地改写（id 改写见 usage.py:rewrite_leg2_line 顶部注释——续写腿是网关自己发起的
     新请求，下游会分配一个新 completion id，不改写的话客户端会看到 id 中途变化）。同样先
-    无限等第一个 chunk 再开始用 idle timeout；单次续写策略下，这条腿不管怎么失败（第一个
-    chunk 就断、还是后面卡住/断线），都不再发第三条腿，直接安静结束，让调用方把流正常收尾。
+    无限等第一个 chunk 再开始用 idle timeout。
+
+    单次续写策略下这条腿没有第三条腿可退，所以 idle timeout 在这里不该再有"结束这条腿"的
+    效果——停下来也换不来任何补救动作，唯一自洽的选择是跟没有这层网关时一样继续等（下游
+    真的只是慢的话，等下去仍然有机会把流正常说完）；每次 idle timeout 只打一行 warning 留痕
+    （方便观测下游到底卡了多久、卡了几次），不代表放弃。真正的断连/干净 EOF 才会让这条腿
+    结束，因为已经没有字节可读了，等也没用，这个终点和没有网关时一致。
+
     返回 (outcome, finished)：outcome 是这条腿结束的原因，纯粹给调用方打日志用；finished
     是有没有在结束前见过 finish_reason——单靠 outcome 的文字（比如"clean EOF"）分不清
-    "正常说完后连接关闭"和"没说完就断了"，这里额外喂一份 StreamState 只为了拿这个信号，
-    不影响"不发第三条腿"这个既定行为。
+    "正常说完后连接关闭"和"没说完就断了"，这里额外喂一份 StreamState 只为了拿这个信号。
     """
     state = StreamState()
     try:
@@ -215,12 +233,18 @@ async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: Line
         feed_line(line, state)
         await out.write(rewrite_leg2_line(line, recovered, response_id) + b"\n")
 
-    stall_reason = []
-    async for chunk in timed_reads(downstream_content, config.STALL_IDLE_TIMEOUT_SECONDS, stall_reason):
-        for line in splitter.feed(chunk):
-            feed_line(line, state)
-            await out.write(rewrite_leg2_line(line, recovered, response_id) + b"\n")
-    return stall_reason[0], state.finish_reason is not None
+    while True:
+        stall_reason = []
+        async for chunk in timed_reads(downstream_content, config.STALL_IDLE_TIMEOUT_SECONDS, stall_reason):
+            for line in splitter.feed(chunk):
+                feed_line(line, state)
+                await out.write(rewrite_leg2_line(line, recovered, response_id) + b"\n")
+        reason = stall_reason[0]
+        if reason.startswith("idle timeout"):
+            log.warning("[continuation req=%s] leg2 stalled (%s), no third leg, continuing to wait",
+                        log_id, reason)
+            continue
+        return reason, state.finish_reason is not None
 
 
 async def attempt_continuation(session: ClientSession, target: str, headers: dict, original_payload: dict,
@@ -277,7 +301,7 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
     splitter = LineSplitter()
     try:
         leg2_outcome, leg2_finished = await relay_leg2(downstream.content, out, splitter, recovered,
-                                                         state.response_id)
+                                                         state.response_id, log_id)
     finally:
         downstream.release()
     if leg2_finished:

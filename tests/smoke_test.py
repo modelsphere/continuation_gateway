@@ -184,6 +184,49 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
             }}))
             await resp.write(b"data: [DONE]\n\n")
 
+    elif scenario == "tool_call_seen_stall_then_resumes":
+        # 验证"tool_call 已出现后 idle timeout 不再结束这条腿"：卡住的时间比 idle timeout
+        # (0.6s) 长，但下游其实没死，之后还会正常吐完。如果网关在 tool_calls_seen 之后仍然
+        # 让 idle timeout 结束循环，这条流会在 finish_reason 到达之前就被切断，下面的断言会
+        # 直接失败；只有网关老实等下去才能收到完整的 finish_reason。
+        await resp.write(sse({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "x:0", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+        ]}}]}))
+        await asyncio.sleep(0.9)
+        await resp.write(sse({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}))
+        await resp.write(b"data: [DONE]\n\n")
+        assert call_n == 1, "不该有第二次调用（tool_call 出现后不救）"
+
+    elif scenario == "no_content_stall_then_resumes":
+        # 验证"还没攒到任何可恢复内容时 idle timeout 也不该结束这条腿"：只吐了一个空白的
+        # 角色声明 chunk（reasoning/content 都是空的），卡住的时间比 idle timeout 长，之后
+        # 下游继续正常吐出实质内容。如果网关在"目前没有可恢复内容"时仍然让 idle timeout
+        # 结束循环（旧行为），这条流会在任何实质内容到达之前就被切断收尾。
+        await resp.write(sse({"choices": [{"delta": {"role": "assistant"}}]}))
+        await asyncio.sleep(0.9)
+        await resp.write(sse({"choices": [{"delta": {"content": "actually here"}}]}))
+        await resp.write(sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+        await resp.write(b"data: [DONE]\n\n")
+        assert call_n == 1, "不该有第二次调用（不是续写场景，只是老实等）"
+
+    elif scenario == "leg2_stall_then_resumes":
+        # 验证 leg2 同样的规则：单次续写没有第三条腿可退，所以 leg2 里的 idle timeout 也
+        # 不该结束这条腿——卡住的时间比 idle timeout 长，之后 leg2 还会正常吐完。如果网关
+        # 在 leg2 卡住时就放弃收尾（旧行为），最终 content/finish_reason 收不全。
+        if call_n == 1:
+            await resp.write(sse({"choices": [{"delta": {"content": "leg1 partial"}}]}))
+            await asyncio.sleep(5)
+        else:
+            assert body.get("continue_final_message") is True
+            await resp.write(sse({"choices": [{"delta": {"content": " leg2 first half"}}]}))
+            await asyncio.sleep(0.9)
+            await resp.write(sse({"choices": [{"delta": {"content": " leg2 second half"}}]}))
+            await resp.write(sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+            await resp.write(sse({"choices": [], "usage": {
+                "prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14, "reasoning_tokens": 0,
+            }}))
+            await resp.write(b"data: [DONE]\n\n")
+
     elif scenario == "max_completion_tokens_field":
         if call_n == 1:
             await resp.write(sse({"choices": [{"delta": {"content": "partial with mct"}}]}))
@@ -328,6 +371,32 @@ async def main():
         print("  ", r)
         check("no finish_reason (流被卡住后老实结束，不续写)", r["finish_reason"] is None)
         check("only 1 downstream call made", call_counts.get("tool_call_seen_no_rescue") == 1)
+
+        print("\n== tool_call_seen_stall_then_resumes (tool_call 出现后 idle timeout 不该掐断连接) ==")
+        r = await call_gateway("tool_call_seen_stall_then_resumes")
+        print("  ", r)
+        check("finish_reason eventually arrives (没有被 idle timeout 提前掐断)",
+              r["finish_reason"] == "tool_calls", r["finish_reason"])
+        check("only 1 downstream call made (仍然没有触发续写)",
+              call_counts.get("tool_call_seen_stall_then_resumes") == 1)
+
+        print("\n== no_content_stall_then_resumes (还没有可恢复内容时 idle timeout 不该掐断连接) ==")
+        r = await call_gateway("no_content_stall_then_resumes")
+        print("  ", r)
+        check("content eventually arrives (没有被 idle timeout 提前掐断)",
+              r["content"] == "actually here", r["content"])
+        check("finish_reason present", r["finish_reason"] == "stop")
+        check("only 1 downstream call made (老实等到底，不是靠续写救回来的)",
+              call_counts.get("no_content_stall_then_resumes") == 1)
+
+        print("\n== leg2_stall_then_resumes (leg2 里 idle timeout 也不该掐断连接) ==")
+        r = await call_gateway("leg2_stall_then_resumes")
+        print("  ", r)
+        check("leg2 content merged across the stall",
+              r["content"] == "leg1 partial leg2 first half leg2 second half", r["content"])
+        check("finish_reason present (leg2 卡住后没有被提前收尾)", r["finish_reason"] == "stop")
+        check("only 2 downstream calls (leg1 + leg2, 没有第三条腿)",
+              call_counts.get("leg2_stall_then_resumes") == 2)
 
         print("\n== no_chunk_clean_eof (一个字节都没吐、干净 EOF，不属于续写范畴) ==")
         r = await call_gateway("no_chunk_clean_eof")
