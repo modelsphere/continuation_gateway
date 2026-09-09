@@ -74,16 +74,26 @@ def filter_headers(headers):
 
 
 def should_intervene(payload: dict, body_size: int) -> bool:
+    # 每个 return False 分支都要留一行日志——这个函数决定一条请求是走 guarded()（有续写
+    # 覆盖，后续日志走"[continuation req=...]"那一套）还是 passthrough()（纯转发，
+    # 只有 passthrough() 自己那一行日志），任何一个分支悄悄漏判都会导致事后查不到"这条
+    # 请求当时为什么没进续写覆盖"。
+    model = (payload.get("model") or "").lower()
     if not payload.get("stream"):
+        log.info("model=%s non-stream request, skipping continuation coverage (passthrough only)",
+                  payload.get("model"))
         return False
     if payload.get("continue_final_message"):
         # 客户端自己发的续写请求不再续写：最后一条 assistant 消息的 partial 内容是客户端
         # 自己拼的，格式不可控，跟这里的重建逻辑假设的"partial 状态来自一次正常、未续写过
         # 的流式响应"这个前提不符；而且 usage 修正公式假设"恰好两条腿"，如果在客户端自己的
         # 续写之上再续一次，没法可靠知道客户端那次续写已经消耗了多少 token，会破坏公式。
+        log.info("model=%s client already sent continue_final_message, skipping continuation "
+                  "coverage (passthrough only)", payload.get("model"))
         return False
-    model = (payload.get("model") or "").lower()
     if not config.CONTINUATION_MODELS or model not in config.CONTINUATION_MODELS:
+        log.info("model=%s not in CONTINUATION_MODELS=%s, skipping continuation coverage "
+                  "(passthrough only)", payload.get("model"), config.CONTINUATION_MODELS or "<none configured>")
         return False
     if (payload.get("response_format") or {}).get("type") in ("json_object", "json_schema"):
         # 结构化输出（json_object/json_schema）不进续写，且不打算靠改 SGLang 支持——这条跟
@@ -100,8 +110,7 @@ def should_intervene(payload: dict, body_size: int) -> bool:
     if body_size > config.MAX_CONTINUATION_BODY_BYTES:
         # 大 body（典型是内嵌图片/视频的多模态请求）不进续写：解析后的 payload dict 要在
         # 内存里拿着直到流结束，续写真发生时 messages 数组还要原样再序列化/传输两次，body
-        # 越大这个代价越不划算。只在"其他条件都满足、纯粹因为超限被排除"时才打这行日志，
-        # 不会给占大多数的非续写流量（别的 model/非 stream 请求）添噪音。
+        # 越大这个代价越不划算。
         log.info("request body %d bytes exceeds MAX_CONTINUATION_BODY_MB=%d, skipping "
                   "continuation coverage for this request (passthrough only): model=%s",
                   body_size, config.MAX_CONTINUATION_BODY_MB, payload.get("model"))
@@ -152,6 +161,10 @@ async def _stream_downstream_verbatim(request: web.Request, downstream) -> web.S
 async def passthrough(request: web.Request, raw_body: bytes = None) -> web.StreamResponse:
     session: ClientSession = request.app["session"]
     target = config.DOWNSTREAM_URL + request.path_qs
+    # 这一层不解析 body（catch_all 打过来的请求甚至不一定是 JSON），所以日志只能落到
+    # method/path 这个粒度——但这条请求"走的是纯转发、没有续写覆盖"这件事本身必须留痕，
+    # 不然配合 should_intervene() 那些 skip 日志也拼不出这条请求的完整去向。
+    log.info("PASSTHROUGH %s %s -> %s", request.method, request.path_qs, target)
     headers = filter_headers(request.headers)
     data = raw_body if raw_body is not None else (request.content if request.can_read_body else None)
     del raw_body  # 用完就扔，见 chat_completions() 里同样处理的注释
@@ -159,6 +172,7 @@ async def passthrough(request: web.Request, raw_body: bytes = None) -> web.Strea
         downstream = await session.request(request.method, target, headers=headers, data=data,
                                           allow_redirects=False)
     except (ClientError, asyncio.TimeoutError) as e:
+        log.warning("PASSTHROUGH %s %s failed: %s", request.method, request.path_qs, e)
         return web.Response(status=502, text=f"downstream error: {e}\n")
     del data
     return await _stream_downstream_verbatim(request, downstream)
@@ -360,6 +374,7 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
     try:
         downstream = await session.post(target, headers=headers, data=raw_body, allow_redirects=False)
     except (ClientError, asyncio.TimeoutError) as e:
+        log.warning("[continuation req=%s] FAILED reason=leg1_connect_error: %s", req_id, e)
         return web.Response(status=502, text=f"downstream error: {e}\n")
     # 原始字节只在上面这次 POST 里用一次——续写腿是从解析好的 payload dict 重建的，不需要
     # raw_body。并发多、body 又可能带 base64 图片这种大 payload 时，不早点扔掉这份引用的话，
@@ -367,6 +382,9 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
     del raw_body
 
     if downstream.status != 200:
+        log.warning("[continuation req=%s] leg1 downstream returned status=%s before any streaming, "
+                    "forwarding error response verbatim (no continuation attempted)",
+                    req_id, downstream.status)
         return await _stream_downstream_verbatim(request, downstream)
 
     resp_headers = filter_headers(downstream.headers)
@@ -427,6 +445,15 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
             # 收到过 chunk 但没有任何可用的 reasoning/content（比如只有一个空白的角色声明
             # chunk），没有实际内容可救，不属于续写范畴，流按原样收尾。
             log.info("[continuation req=%s] SKIPPED reason=no_recoverable_content", log_id)
+    else:
+        # 这条请求被判定为需要续写覆盖（should_intervene() 通过），但 leg1 从头到尾没有
+        # 出问题：要么第一个 chunk 就是干净 EOF（stall_reason 为 None，下游一个字节都没吐，
+        # 理论上不该发生但也不该静默）、要么正常见到了 finish_reason 后连接关闭。两种情况
+        # 都没有触发 TRIGGERED，之前完全没有日志——不留痕的话，这类"啥事没有"的多数请求
+        # 在日志里会跟"网关根本没处理过这条请求"没法区分。
+        log_id = state.response_id or req_id
+        log.info("[continuation req=%s] COMPLETED normally, no continuation needed (leg1_end=%s)",
+                  log_id, stall_reason or "clean EOF on first read")
 
     try:
         await out.write_eof()
