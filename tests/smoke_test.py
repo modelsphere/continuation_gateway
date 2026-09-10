@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 
 os.environ["DOWNSTREAM_URL"] = "http://127.0.0.1:18081"
 os.environ["CONTINUATION_MODELS"] = "test-model,kimi-k3"
@@ -37,6 +38,11 @@ DOWNSTREAM_PORT = 18081
 GATEWAY_PORT = 18082
 
 call_counts = {}  # scenario -> call count，用来分辨"这是第一条腿还是续写腿"
+# upstream_disconnect_before_first_chunk 专用：网关这边的 task 被正确 cancel 会连带断掉
+# 它到这个假 downstream 的连接，这里的 asyncio.sleep 会被提前打断而设这个 event，而不是
+# 乖乖睡完——用它证明"客户端断连"这个信号真的传导到了网关正在等 leg1 第一个 chunk 的这个
+# task，而不只是"客户端自己放弃了"（那个不用靠这个 event 也能验证到）。
+downstream_cancel_event = asyncio.Event()
 
 
 def sse(obj) -> bytes:
@@ -148,6 +154,22 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
         assert call_n == 1, "不该有第二次调用"
         raise ConnectionResetError("simulated crash before any chunk")
 
+    elif scenario == "upstream_disconnect_before_first_chunk":
+        # 这个假 downstream 已经连上、响应头也发了（resp.prepare() 在函数最上面已经调过），
+        # 但故意长时间不写任何 body 字节——模拟"leg1 已经连上但迟迟没有第一个 chunk"，网关
+        # 这时候正卡在 relay() 里 `await downstream_content.readany()`。真正要验证的不是
+        # 下游这边的行为，是网关那边：客户端提前断连之后，网关是不是把这个还在等第一个
+        # chunk 的 task 尽快 cancel 掉了（handler_cancellation=True 保护的正是这个阶段，
+        # 默认关闭时网关会傻等到自己的超时才反应）。用 CancelledError
+        # 而不是等 sleep 自然结束来判断"网关是不是真的提前断了"——网关那边的 task 被正确
+        # cancel，会连带断掉它这一端到这个假 downstream 的连接，这里的 sleep 会被打断。
+        try:
+            await asyncio.sleep(8)
+        except asyncio.CancelledError:
+            downstream_cancel_event.set()
+            raise
+        return web.Response(status=200, text="should never get here")
+
     elif scenario == "passthrough_check":
         # 纯透传场景：不管调几次都立刻正常返回，不卡、不断连，用来验证非 continuation
         # model 走的是纯转发，网关完全没有介入（没有 idle timeout 包装、没有 SSE 解析）。
@@ -250,7 +272,12 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
 async def run_downstream():
     app = web.Application(client_max_size=gw_config.MAX_REQUEST_BODY_BYTES)
     app.router.add_post("/v1/chat/completions", downstream_chat)
-    runner = web.AppRunner(app)
+    # handler_cancellation=True：跟 run_gateway() 一样的原因（见那边注释）。这个假 downstream
+    # 自己不需要靠这个感知谁断了它，但 upstream_disconnect_before_first_chunk 那个场景要靠
+    # "网关断开自己到这个假 downstream 的连接后，这里的 sleep 被 CancelledError 打断"来
+    # 证明网关那边真的提前 cancel 了——如果这里不开，就算网关那边修好了，这个假 downstream
+    # 的 handler 也感知不到连接已经没了，会乖乖睡完，测试会看起来像没修好。
+    runner = web.AppRunner(app, handler_cancellation=True)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", DOWNSTREAM_PORT)
     await site.start()
@@ -264,7 +291,12 @@ async def run_gateway():
     app.router.add_post("/v1/chat/completions", gw_server.chat_completions)
     app.router.add_get("/health", gw_server.health)
     app.router.add_route("*", "/{tail:.*}", gw_server.catch_all)
-    runner = web.AppRunner(app)
+    # handler_cancellation=True：镜像 server.py:main() 里 web.run_app() 的同一个参数（见
+    # 那边注释）——不带这个参数会用 aiohttp 的默认值 False，这个测试服务器的行为就跟生产
+    # 环境不一样了。这里手搭的 web.AppRunner 和 aiohttp.test_utils（它默认就是
+    # handler_cancellation=True）走的是两条默认值不同的路径，用后者测出来的"客户端断连
+    # 不管卡在哪都能被感知到"这类结论不能代表用前者搭建的生产服务的真实行为。
+    runner = web.AppRunner(app, handler_cancellation=True)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", GATEWAY_PORT)
     await site.start()
@@ -412,6 +444,40 @@ async def main():
         check("client sees the connection abort (not silently swallowed into empty 200)",
               r["aborted"])
         check("only 1 downstream call (没有重试)", call_counts.get("no_chunk_disconnect") == 1)
+
+        print("\n== upstream_disconnect_before_first_chunk (客户端在等第一个 chunk 阶段先"
+              "断连，网关不该傻等) ==")
+        # 客户端自己配一个很短的 total 超时（1s），远小于下游这次故意挂着不回的时长（8s），
+        # 模拟"客户端超时早于下游能给出任何响应"这种结构——客户端自己配的超时明显短于网关
+        # 等下游的耗时上限时，不该是网关先撑到自己的超时才反应，应该是客户端一放弃网关就
+        # 跟着反应过来。
+        downstream_cancel_event.clear()
+        t0 = time.monotonic()
+        client_gave_up = False
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=1)) as client:
+                async with client.post(
+                        f"http://127.0.0.1:{GATEWAY_PORT}/v1/chat/completions",
+                        json={"model": "test-model", "stream": True, "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]},
+                        headers={"X-Test-Scenario": "upstream_disconnect_before_first_chunk"}) as resp:
+                    await resp.read()
+        except asyncio.TimeoutError:
+            client_gave_up = True
+        check("client gave up around its own 1s timeout", client_gave_up)
+        try:
+            # 给网关一点反应时间（远小于下游 8s 的 sleep），但不需要等太久——修复生效的话
+            # 应该几乎立刻（毫秒级）就传导到位，3s 已经是很宽松的上限。
+            await asyncio.wait_for(downstream_cancel_event.wait(), timeout=3.0)
+            gateway_reacted_fast = True
+        except asyncio.TimeoutError:
+            gateway_reacted_fast = False
+        elapsed = time.monotonic() - t0
+        check("gateway aborted its own leg1 wait promptly after client gave up "
+              "(not waiting for downstream's full 8s hang)", gateway_reacted_fast,
+              f"elapsed={elapsed:.2f}s")
+        check("only 1 downstream call",
+              call_counts.get("upstream_disconnect_before_first_chunk") == 1)
 
         print("\n== no_budget_field (客户端两个字段都没传，续写请求不该凭空加预算) ==")
         r = await call_gateway("no_budget_field", drop=["max_tokens"])

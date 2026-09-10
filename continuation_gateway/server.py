@@ -377,6 +377,15 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
 
     try:
         downstream = await session.post(target, headers=headers, data=raw_body, allow_redirects=False)
+    except asyncio.CancelledError:
+        # 客户端在网关还没连上下游之前就断开了（见 main() 里 handler_cancellation 的注释）
+        # ——不是下游连接失败，是这个请求本身已经没人要了，不该算 leg1_connect_error（那个
+        # reason 是留给"下游真的连不上/连太慢"这种下游侧问题的，混进去会误导以后靠这行日志
+        # 排查下游健康状况）。必须原样 `raise`，不能吞掉——吞掉 CancelledError 会破坏任务
+        # 取消的语义，让这次 cancel 看起来像是"处理完了"。
+        log.info("[continuation req=%s] upstream disconnected while still connecting to "
+                  "downstream, aborting connect attempt (not a downstream failure)", req_id)
+        raise
     except (ClientError, asyncio.TimeoutError) as e:
         log.warning("[continuation req=%s] FAILED reason=leg1_connect_error: %s", req_id, e)
         # 这里连不上下游，返回 429 而不是 502
@@ -411,17 +420,22 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
     splitter = LineSplitter()
     try:
         needs_retry, stall_reason = await relay(downstream.content, out, state, splitter, req_id)
-    except (*DISCONNECT_ERRORS, asyncio.CancelledError):
+    except (*DISCONNECT_ERRORS, asyncio.CancelledError) as e:
         # 这里同时兜两类情况，都不属于续写范畴、都不吞异常：(1) 下游连接出问题——第一个
         # chunk 都没等到、或者读到一半断了（relay() 内部读下游失败，DISCONNECT_ERRORS）；
         # (2) 客户端（上游）断连——relay() 里往 out 写的时候失败也是同一批 DISCONNECT_ERRORS
         # 类型，不特意区分；如果客户端断连发生在我们正无限等第一个 chunk、还没开始往 out 写
-        # 任何东西的时候，靠的是 asyncio.CancelledError——aiohttp 自己的 handler 会在探测到
-        # 客户端连接断开时主动 cancel 当前请求的 task，不管这个 task 当时卡在等下游读还是
-        # 别的什么地方，不会因为我们这层暂时没有主动的读写操作而漏检。两种情况处理方式一样：
-        # 让这次请求按普通失败处理（跟没有这层网关时的行为一致），是否重试交给上层。
-        # downstream.close() 确保这个已经坏掉的连接不会被当成好的放回连接池；下面的 finally
-        # 还会再调一次 release()，在已经 close() 过的连接上是安全的空操作。
+        # 任何东西的时候，靠的是 asyncio.CancelledError——**这条路径要求 main() 里
+        # `web.run_app(..., handler_cancellation=True)` 显式打开**（aiohttp 默认关闭，
+        # 见那边的注释），不是"aiohttp 自带、不用配置就能用"的能力；这个参数不打开的话，
+        # 客户端断连发生在等第一个 chunk 阶段时完全没反应，会一直等到自己配的超时（比如
+        # CONNECT_TIMEOUT_SECONDS）才结束。两种情况处理方式一样：让这次请求按
+        # 普通失败处理（跟没有这层网关时的行为一致），是否重试交给上层。downstream.close()
+        # 确保这个已经坏掉的连接不会被当成好的放回连接池；下面的 finally 还会再调一次
+        # release()，在已经 close() 过的连接上是安全的空操作。
+        log_id = state.response_id or req_id
+        log.info("[continuation req=%s] leg1 aborted (%s: %s), not attempting continuation "
+                  "for this leg", log_id, type(e).__name__, e)
         downstream.close()
         raise
     finally:
@@ -517,7 +531,19 @@ def main():
     app.router.add_route("*", "/{tail:.*}", catch_all)
     log.info("listening on 0.0.0.0:%d, forwarding to %s (continuation models: %s)",
               config.PORT, config.DOWNSTREAM_URL, config.CONTINUATION_MODELS or "<none configured>")
-    web.run_app(app, host="0.0.0.0", port=config.PORT, print=None)
+    # handler_cancellation=True：aiohttp 的默认值是 False，默认值下客户端断连时
+    # RequestHandler.connection_lost() 不会 cancel 正在处理这个请求的 task（读
+    # aiohttp/web_protocol.py 源码确认，`_task_handler.cancel()` 那行套在
+    # `if handler_cancellation and ...` 里）——不打开的话，网关卡在等 leg1 connect（比如
+    # 下游一度没有健康实例、TCP connect 本身悬着不回）这种阶段时，客户端就算早就按自己的
+    # 超时断开了，网关这边的 task 也完全没反应，只能一直等到自己配的 CONNECT_TIMEOUT_
+    # SECONDS 才结束，白白多占几分钟的连接和请求状态。显式传 True 之后，客户端断连后不管
+    # 这个 task 当时卡在哪个 await 上（等 leg1 connect、等 leg1 数据、等 leg2 数据……）都会
+    # 被尽快 cancel，不用再靠自己配的各种超时兜底。**这个参数也要跟测试环境保持一致**——
+    # `aiohttp.test_utils.TestServer` 内部默认就是 `handler_cancellation=True`，如果这里
+    # 不显式设置，本地冒烟测试（用真实 `web.AppRunner`，不是 `test_utils`）跟生产环境用的
+    # 会是两个不同的默认值，测试"验证过"的行为不能代表生产的真实行为。
+    web.run_app(app, host="0.0.0.0", port=config.PORT, print=None, handler_cancellation=True)
 
 
 if __name__ == "__main__":
