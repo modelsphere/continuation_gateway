@@ -16,6 +16,17 @@ CONTINUATION_MODELS = {
 STALL_IDLE_TIMEOUT_SECONDS = float(os.environ.get("STALL_IDLE_TIMEOUT_SECONDS", "20"))
 CONNECT_TIMEOUT_SECONDS = float(os.environ.get("CONNECT_TIMEOUT_SECONDS", "30"))
 
+# 网关到下游（DOWNSTREAM_URL）的所有出向连接共用同一个连接池（server.py on_startup() 建的
+# 那个 ClientSession）——不显式设置的话用的是 aiohttp TCPConnector 的库默认值 100。这个上限
+# 管的不只是"正在建连"那一下，是"从跟连接器申请连接、到这次请求彻底用完释放"整个区间，
+# 包括发完请求头之后老老实实等/读下游流式响应的那一大段时间都占着名额。这个网关的流量形态
+# 是每个连接要占用一整条流式响应的时长（可能几秒到几分钟），不是典型 REST API 毫秒级用完
+# 就还，100 在真实并发规模下明显偏低——超过这个数的请求不会失败，只是在网关内部排队等空闲
+# 槽位，这段排队延迟从客户端侧看跟"下游真的慢"长得一样，容易被误判成下游容量不够，实际是
+# 网关自己的连接池在排队。默认给到 500，比库默认值宽松很多；实际部署按目标并发量再调，
+# 建议明显高于预期峰值并发，留出余量。
+DOWNSTREAM_CONNECTION_LIMIT = int(os.environ.get("DOWNSTREAM_CONNECTION_LIMIT", "500"))
+
 # request body 超过这个大小就不进入续写逻辑（只当普通请求透传，卡住/断了也不救）——续写要
 # 把 payload 解析成 dict 后整个拿着直到这条流结束（不像 raw_body 用完就能扔），大 body（比如
 # 内嵌了图片/视频的多模态请求）意味着这份 dict 要在内存里多待很久。默认 10MB：上游请求体

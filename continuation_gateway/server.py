@@ -37,6 +37,7 @@ from aiohttp import (
     ClientSession,
     ClientTimeout,
     ServerDisconnectedError,
+    TCPConnector,
     web,
 )
 
@@ -513,6 +514,7 @@ async def catch_all(request: web.Request) -> web.StreamResponse:
 async def on_startup(app: web.Application):
     app["session"] = ClientSession(
         auto_decompress=False,
+        connector=TCPConnector(limit=config.DOWNSTREAM_CONNECTION_LIMIT),
         timeout=ClientTimeout(total=None, connect=config.CONNECT_TIMEOUT_SECONDS),
     )
 
