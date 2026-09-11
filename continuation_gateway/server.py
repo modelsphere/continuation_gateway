@@ -1,7 +1,7 @@
 """Kimi-K3 崩溃续写网关 —— v1 范围：只处理"崩溃时还没出现过 tool_call chunk、且请求本身没有
-用 response_format 约束成 json_object/json_schema"的情况（普通自由文本的 content-done /
-thinking-partial）。两类场景明确排除，都在 `should_intervene()`/`state.tool_calls_seen`
-里挡掉：
+用 response_format 约束成 json_object/json_schema、且不带图片/音频/视频这类非文本内容"的
+情况（普通自由文本的 content-done / thinking-partial）。三类场景明确排除，都在
+`should_intervene()`/`state.tool_calls_seen` 里挡掉：
 
 - tool_call：`continue_final_message` 标准语义下 `tool_calls` 字段代表"这轮已经说完、该
   tool 角色回复了"，没有"还在生成中"的状态位，要支持得改 SGLang 源码，这里不做（这条崩溃时
@@ -11,6 +11,11 @@ thinking-partial）。两类场景明确排除，都在 `should_intervene()`/`st
   出来，跟自由文本没有独立信号能区分，网关这层要单独识别"这段 content 其实是被 guided
   decoding 约束着的"再决定怎么重建前缀，复杂度不值得。这条从原始请求的 response_format
   字段就能直接判断，不用等流式过程中才发现，在 `should_intervene()` 里前置排除。
+- 带非文本内容（图片/音频/视频）的多模态请求：usage.py 的 usage 修正只按字符数估算 token，
+  非文本内容没有对应的字符数可数，续写发生时报给客户端的 corrected prompt_tokens 会严重
+  偏小（实测过真实 6 万多 token 的图片请求，估算结果只有 12），是真实的账目错误，不是可
+  接受的估算偏差。这条也是从原始请求就能判断，`should_intervene()` 里前置排除，见
+  `_has_multimodal_content()`。
 
 跑法（下游预期是一个机房/集群路由网关，不是直连某个具体 SGLang 实例；原始请求和续写请求打
 同一个 URL，实例选择/避开故障实例交给下游网关负责，这一层不自己维护 SGLang 实例列表）：
@@ -74,6 +79,25 @@ def filter_headers(headers):
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
 
 
+def _has_multimodal_content(payload: dict) -> bool:
+    """粗略判断这条请求是不是带了非文本内容（图片/音频/视频这类 content-part）。usage.py
+    的 estimate_tokens() 只按字符数估算 token，`_message_text()` 里对非 text 的 content-part
+    是直接跳过的——这些内容压根没有对应的字符数可数，估算出来的 prompt_tokens 会严重偏小，
+    不是"偏差可接受"的量级：实测过一条带图片的真实请求，真实 prompt 有六万多 token，估算
+    结果只有 12。不像大小超限那样只是"代价不划算"，这里是账目本身算不出来，所以在这个函数
+    里单独判断、直接排除，不是靠 MAX_CONTINUATION_BODY_MB 顺带兜底——body 字节数和图片对应
+    的 token 数没有稳定的线性关系，一条 body 在阈值以内的图片请求，真实 token 量完全可能
+    远超预期，靠大小阈值挡不住。"""
+    for message in payload.get("messages", []):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") not in (None, "text"):
+                return True
+    return False
+
+
 def should_intervene(payload: dict, body_size: int) -> bool:
     # 每个 return False 分支都要留一行日志——这个函数决定一条请求是走 guarded()（有续写
     # 覆盖，后续日志走"[continuation req=...]"那一套）还是 passthrough()（纯转发，
@@ -107,6 +131,14 @@ def should_intervene(payload: dict, body_size: int) -> bool:
         log.info("response_format.type=%s, skipping continuation coverage for this request "
                   "(passthrough only): model=%s", payload["response_format"].get("type"),
                   payload.get("model"))
+        return False
+    if _has_multimodal_content(payload):
+        # 带图片/音频/视频这类非文本内容的请求不进续写——不是代价不划算（那是下面 body 大小
+        # 那条的判断），是账目本身算不准：usage.py 的字符数估算法对这类内容完全没有对应的
+        # token 数可数，续写发生时报给客户端的 corrected prompt_tokens 会严重偏小，是真实
+        # 计费错误，不是可接受的估算偏差。
+        log.info("request contains non-text content parts (multimodal), skipping continuation "
+                  "coverage for this request (passthrough only): model=%s", payload.get("model"))
         return False
     if body_size > config.MAX_CONTINUATION_BODY_BYTES:
         # 大 body（典型是内嵌图片/视频的多模态请求）不进续写：解析后的 payload dict 要在

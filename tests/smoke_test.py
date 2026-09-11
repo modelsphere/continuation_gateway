@@ -192,6 +192,17 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
         await resp.write(sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
         await resp.write(b"data: [DONE]\n\n")
 
+    elif scenario == "multimodal_passthrough":
+        # messages 里带了 image_url 这种非文本 content-part，故意卡住比 idle timeout 更久
+        # （0.6s）——如果这条请求被 guarded() 接管了，会触发续写、发出第二次下游调用；
+        # 断言 call_n == 1 就是在证明它压根没被接管，是纯转发（下游卡多久网关都不管），不是
+        # "碰巧这次没卡住所以看不出区别"那种弱验证。estimate_tokens() 对非文本内容没有对应
+        # 的字符数可数，续写发生的话 corrected prompt_tokens 会严重偏小，属于账目算不准，
+        # 不是"代价不划算"，所以直接排除，不进 guarded()。
+        await resp.write(sse({"choices": [{"delta": {"content": "described the image partial"}}]}))
+        await asyncio.sleep(5)
+        assert call_n == 1, "不该有第二次调用（多模态不进续写）"
+
     elif scenario == "no_budget_field":
         if call_n == 1:
             await resp.write(sse({"choices": [{"delta": {"content": "no limit set"}}]}))
@@ -403,6 +414,18 @@ async def main():
         print("  ", r)
         check("no finish_reason (流被卡住后老实结束，不续写)", r["finish_reason"] is None)
         check("only 1 downstream call made", call_counts.get("tool_call_seen_no_rescue") == 1)
+
+        print("\n== multimodal_passthrough (带图片的请求不该进续写，账不出对) ==")
+        r = await call_gateway("multimodal_passthrough", extra={"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "what is in this image?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,fakeimagedata"}},
+            ]},
+        ]})
+        print("  ", r)
+        check("no finish_reason (流被卡住后老实结束，不续写)", r["finish_reason"] is None)
+        check("only 1 downstream call made (没有触发续写编排)",
+              call_counts.get("multimodal_passthrough") == 1)
 
         print("\n== tool_call_seen_stall_then_resumes (tool_call 出现后 idle timeout 不该掐断连接) ==")
         r = await call_gateway("tool_call_seen_stall_then_resumes")
