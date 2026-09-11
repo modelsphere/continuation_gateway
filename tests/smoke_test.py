@@ -144,6 +144,18 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
         await asyncio.sleep(5)  # 卡住，但 v1 范围排除 tool_call，网关不该发第二条腿
         assert call_n == 1, "不该有第二次调用"
 
+    elif scenario == "role_only_disconnect":
+        # 只吐一个空白的角色声明 chunk（没有 reasoning、没有 content、没有 tool_calls），
+        # 然后直接断连——leg1 确实收到过 chunk（needs_retry 会是 True，TRIGGERED 会打出来），
+        # 但没有任何可恢复内容，应该落进 SKIPPED reason=no_recoverable_content、case=empty，
+        # 不该被误判成 thinking-partial（旧版 classify_case() 只看 content 是否非空，会把这种
+        # "什么实质内容都没见过"的情况误标成"还在 thinking"，见 reconstruct.classify_case()
+        # 顶部注释）。
+        await resp.write(sse({"choices": [{"delta": {"role": "assistant"}}]}))
+        await resp.write_eof()
+        resp.force_close()
+        raise ConnectionResetError("simulated crash with nothing recoverable yet")
+
     elif scenario == "no_chunk_clean_eof":
         # 一个字节都没吐、直接干净 EOF——不属于续写范畴，网关不该重试，只应该有这一次调用。
         assert call_n == 1, "不该有第二次调用"
@@ -422,6 +434,14 @@ async def main():
         print("  ", r)
         check("no finish_reason (流被卡住后老实结束，不续写)", r["finish_reason"] is None)
         check("only 1 downstream call made", call_counts.get("tool_call_seen_no_rescue") == 1)
+
+        print("\n== role_only_disconnect (只见过空白角色声明就断连，没有可恢复内容，不救) ==")
+        r = await call_gateway("role_only_disconnect")
+        print("  ", r)
+        check("no finish_reason (没有可恢复内容，不续写)", r["finish_reason"] is None)
+        check("no reasoning/content recovered", r["reasoning"] == "" and r["content"] == "")
+        check("only 1 downstream call made (SKIPPED reason=no_recoverable_content，不发第二条腿)",
+              call_counts.get("role_only_disconnect") == 1)
 
         print("\n== multimodal_continuation (多模态请求也走续写，usage 用减法公式) ==")
         r = await call_gateway("multimodal_continuation", extra={"messages": [

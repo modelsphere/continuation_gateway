@@ -51,7 +51,7 @@ from aiohttp import (
 )
 
 from . import config
-from .reconstruct import build_prefix, needs_thinking_disabled
+from .reconstruct import build_prefix, classify_case, needs_thinking_disabled
 from .sse import LineSplitter, StreamState, feed_line
 from .usage import estimate_recovered_tokens, rewrite_leg2_line
 
@@ -317,9 +317,19 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
     # usage.correct_usage() 遇到 is_multimodal=True 时会换成从 leg2 真实 prompt_tokens 减算，
     # 不使用这个估算值——但这里仍然照常算出来、照常打进日志，方便跟减算结果对照排查。
     is_multimodal = _has_multimodal_content(original_payload)
-    log.info("[continuation req=%s] ATTEMPT prompt=%d reasoning=%d content=%d total_recovered=%d multimodal=%s",
-              log_id, recovered.prompt_tokens, recovered.reasoning_tokens, recovered.content_tokens,
-              recovered.total_recovered, is_multimodal)
+    # case（见 reconstruct.classify_case()）到这一步已经是确定真的会发第二条腿之后的状态了
+    # （tool_call_seen/no_recoverable_content 两个排除分支已经在 guarded() 里过滤掉，v1
+    # 范围内 state.tool_calls_seen 到这里必然是 False，传它只是让这次调用跟 classify_case()
+    # 的完整签名保持一致——以后 v2 如果放开 tool_call 场景也能真的走到这个函数，这里不用改），
+    # 目前实际只会落在 content-done/thinking-partial 二选一，直接决定了下面 build_prefix()
+    # 走哪个分支、needs_thinking_disabled() 是不是为真——跟 TRIGGERED 那行的 case 字段用的
+    # 是同一份判断依据，两处应该总是一致的（除非 state.content 在两次调用之间被改过，不应该
+    # 发生）。
+    case = classify_case(state.tool_calls_seen, state.reasoning, state.content)
+    log.info("[continuation req=%s] ATTEMPT case=%s prompt=%d reasoning=%d content=%d "
+              "total_recovered=%d multimodal=%s",
+              log_id, case, recovered.prompt_tokens, recovered.reasoning_tokens,
+              recovered.content_tokens, recovered.total_recovered, is_multimodal)
 
     # 客户端原始请求用的是 max_tokens 还是 max_completion_tokens（新旧两个字段，语义等价），
     # 续写请求就沿用同一个字段名去扣减，不额外发明一个默认预算：客户端两个都没传，意思就是
@@ -356,11 +366,11 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
         downstream = await session.post(target, headers=headers, json=continuation_payload,
                                        allow_redirects=False)
     except (ClientError, asyncio.TimeoutError):
-        log.exception("[continuation req=%s] FAILED reason=leg2_connect_error", log_id)
+        log.exception("[continuation req=%s] FAILED reason=leg2_connect_error case=%s", log_id, case)
         return
 
     if downstream.status != 200:
-        log.warning("[continuation req=%s] FAILED reason=leg2_http_%s", log_id, downstream.status)
+        log.warning("[continuation req=%s] FAILED reason=leg2_http_%s case=%s", log_id, downstream.status, case)
         downstream.release()
         return
 
@@ -371,9 +381,9 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
     finally:
         downstream.release()
     if leg2_finished:
-        log.info("[continuation req=%s] SUCCEEDED leg2_outcome=%s", log_id, leg2_outcome)
+        log.info("[continuation req=%s] SUCCEEDED case=%s leg2_outcome=%s", log_id, case, leg2_outcome)
     else:
-        log.warning("[continuation req=%s] FAILED reason=leg2_incomplete leg2_outcome=%s", log_id, leg2_outcome)
+        log.warning("[continuation req=%s] FAILED reason=leg2_incomplete case=%s leg2_outcome=%s", log_id, case, leg2_outcome)
 
 
 async def chat_completions(request: web.Request) -> web.StreamResponse:
@@ -485,11 +495,16 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
         # 下面几个分支（tool_call/无内容）还会再排除掉一部分。这一行是排查"续写到底有没有
         # 发生、发生了几次"这类问题时唯一的入口：先 grep TRIGGERED 数一次演练触发了多少次，
         # 再挑感兴趣的 log_id（= 客户端看到的 completion id）grep 出这一个请求的完整生命
-        # 周期日志，跟客户端自己记录的这个 id 对上号。
-        log.info("[continuation req=%s] TRIGGERED reason=%s reasoning_chars=%d content_chars=%d "
-                  "tool_calls_seen=%s model=%s",
-                  log_id, stall_reason, len(state.reasoning), len(state.content),
-                  state.tool_calls_seen, payload.get("model"))
+        # 周期日志，跟客户端自己记录的这个 id 对上号。case 字段（tool-call-seen/
+        # content-done/thinking-partial/empty，见 reconstruct.classify_case()）是
+        # "哪种情况的续写"这个问题最早能拿到答案的地方——即使后面被 tool_call_seen/
+        # no_recoverable_content 排除掉、根本没有真的发第二条腿，这里仍然如实记录当时的
+        # 状态，不因为最终没续写就不打。
+        case = classify_case(state.tool_calls_seen, state.reasoning, state.content)
+        log.info("[continuation req=%s] TRIGGERED reason=%s case=%s reasoning_chars=%d "
+                  "content_chars=%d tool_calls_seen=%s model=%s",
+                  log_id, stall_reason, case, len(state.reasoning),
+                  len(state.content), state.tool_calls_seen, payload.get("model"))
         if state.tool_calls_seen:
             # v1 范围排除：已经出现过 tool_call chunk，不在网关能安全处理的范围内，不救。
             log.warning("[continuation req=%s] SKIPPED reason=tool_call_seen", log_id)
@@ -503,7 +518,8 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
                 # 意外类型错误、客户端在续写腿写入过程中断开连接）。不用担心吞掉
                 # asyncio.CancelledError——Python 3.8+ 它是 BaseException 的子类，不会被
                 # `except Exception` 捕获，正常取消/关闭流程不受影响。
-                log.exception("[continuation req=%s] FAILED reason=unexpected_exception", log_id)
+                log.exception("[continuation req=%s] FAILED reason=unexpected_exception case=%s",
+                              log_id, case)
         else:
             # 收到过 chunk 但没有任何可用的 reasoning/content（比如只有一个空白的角色声明
             # chunk），没有实际内容可救，不属于续写范畴，流按原样收尾。
