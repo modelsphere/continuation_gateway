@@ -192,16 +192,24 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
         await resp.write(sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
         await resp.write(b"data: [DONE]\n\n")
 
-    elif scenario == "multimodal_passthrough":
-        # messages 里带了 image_url 这种非文本 content-part，故意卡住比 idle timeout 更久
-        # （0.6s）——如果这条请求被 guarded() 接管了，会触发续写、发出第二次下游调用；
-        # 断言 call_n == 1 就是在证明它压根没被接管，是纯转发（下游卡多久网关都不管），不是
-        # "碰巧这次没卡住所以看不出区别"那种弱验证。estimate_tokens() 对非文本内容没有对应
-        # 的字符数可数，续写发生的话 corrected prompt_tokens 会严重偏小，属于账目算不准，
-        # 不是"代价不划算"，所以直接排除，不进 guarded()。
-        await resp.write(sse({"choices": [{"delta": {"content": "described the image partial"}}]}))
-        await asyncio.sleep(5)
-        assert call_n == 1, "不该有第二次调用（多模态不进续写）"
+    elif scenario == "multimodal_continuation":
+        # messages 里带了 image_url 这种非文本 content-part——多模态请求现在也走续写编排。
+        # usage 修正换了一套算法（减法，见 usage.py correct_usage() 顶部注释）：leg2 真实
+        # 上报的 prompt_tokens 天然包含图片的真实 token 数，减去被救回内容的估算 token 数，
+        # 反推出原始 prompt 的真实 token 数，不再依赖对图片内容做字符数估算（那个估算值不
+        # 可信）。leg2 usage 里的 prompt_tokens 故意给一个远超"对同一段文本做字符数估算"
+        # 能得到的值（模拟图片真实 token 量很大），用来证明修正公式没有偷偷用估算值。
+        if call_n == 1:
+            await resp.write(sse({"choices": [{"delta": {"content": "describing the image partial"}}]}))
+            await asyncio.sleep(5)
+        else:
+            assert body.get("continue_final_message") is True
+            await resp.write(sse({"choices": [{"delta": {"content": " content continued."}}]}))
+            await resp.write(sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+            await resp.write(sse({"choices": [], "usage": {
+                "prompt_tokens": 61234, "completion_tokens": 4, "total_tokens": 61238, "reasoning_tokens": 0,
+            }}))
+            await resp.write(b"data: [DONE]\n\n")
 
     elif scenario == "no_budget_field":
         if call_n == 1:
@@ -415,17 +423,31 @@ async def main():
         check("no finish_reason (流被卡住后老实结束，不续写)", r["finish_reason"] is None)
         check("only 1 downstream call made", call_counts.get("tool_call_seen_no_rescue") == 1)
 
-        print("\n== multimodal_passthrough (带图片的请求不该进续写，账不出对) ==")
-        r = await call_gateway("multimodal_passthrough", extra={"messages": [
+        print("\n== multimodal_continuation (多模态请求也走续写，usage 用减法公式) ==")
+        r = await call_gateway("multimodal_continuation", extra={"messages": [
             {"role": "user", "content": [
                 {"type": "text", "text": "what is in this image?"},
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,fakeimagedata"}},
             ]},
         ]})
         print("  ", r)
-        check("no finish_reason (流被卡住后老实结束，不续写)", r["finish_reason"] is None)
-        check("only 1 downstream call made (没有触发续写编排)",
-              call_counts.get("multimodal_passthrough") == 1)
+        check("content merged correctly",
+              r["content"] == "describing the image partial content continued.", r["content"])
+        check("finish_reason present", r["finish_reason"] == "stop")
+        check("2 downstream calls made (多模态现在会触发续写编排)",
+              call_counts.get("multimodal_continuation") == 2)
+        # leg2 的 mock usage 里 prompt_tokens=61234 是故意给的"真实下游分词结果"（远超对
+        # "describing the image partial" 这段文本做字符数估算能得到的值，模拟图片本身占了
+        # 大部分 token），减法公式应该拿这个真实值减去被救回内容的估算 token 数，而不是直接
+        # 用 recovered.prompt_tokens（对图片内容估不出来、不可信）。
+        recovered_content = est("describing the image partial")
+        expected_prompt_tokens = 61234 - recovered_content
+        check("usage prompt_tokens uses subtraction formula for multimodal "
+              "(leg2 real prompt_tokens - recovered)",
+              r["usage"]["prompt_tokens"] == expected_prompt_tokens, r["usage"])
+        expected_completion = 4 + recovered_content
+        check("usage completion_tokens = leg2(4) + recovered content",
+              r["usage"]["completion_tokens"] == expected_completion, r["usage"])
 
         print("\n== tool_call_seen_stall_then_resumes (tool_call 出现后 idle timeout 不该掐断连接) ==")
         r = await call_gateway("tool_call_seen_stall_then_resumes")

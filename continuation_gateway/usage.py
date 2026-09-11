@@ -83,16 +83,29 @@ def estimate_recovered_tokens(original_payload: dict, reasoning_text: str, conte
     return RecoveredTokens(prompt_tokens, reasoning_tokens, content_tokens)
 
 
-def correct_usage(recovered: RecoveredTokens, final_leg_usage: dict) -> dict:
-    """只做加法，不从 prompt_tokens 里减——从 prompt_tokens 里减需要知道"崩溃前那条腿的
-    prompt 具体长什么样"才能算出重叠部分，风险和实现复杂度都更高，加法路线牺牲一点精确度
-    换取更简单、更不容易出错的实现。cached_tokens 要 clamp 成严格小于 corrected_prompt_tokens，
-    避免账面上出现 cached_tokens 顶到/超过 prompt_tokens 这种容易让人起疑的极端值——这本身
-    不是数据错了，是两个数字的分母不一样（cached_tokens 是对着续写腿实际处理的大 prompt 算的，
-    原始请求里被保留下来的那部分内容命中缓存的概率天然更高）。"""
+def correct_usage(recovered: RecoveredTokens, final_leg_usage: dict, is_multimodal: bool = False) -> dict:
+    """completion/reasoning_tokens 只做加法，不从 prompt_tokens 里减——从 prompt_tokens 里减
+    需要知道"崩溃前那条腿的 prompt 具体长什么样"才能算出重叠部分，风险和实现复杂度都更高，
+    加法路线牺牲一点精确度换取更简单、更不容易出错的实现。cached_tokens 要 clamp 成严格小于
+    corrected_prompt_tokens，避免账面上出现 cached_tokens 顶到/超过 prompt_tokens 这种容易
+    让人起疑的极端值——这本身不是数据错了，是两个数字的分母不一样（cached_tokens 是对着续写腿
+    实际处理的大 prompt 算的，原始请求里被保留下来的那部分内容命中缓存的概率天然更高）。
+
+    prompt_tokens 是例外：多模态请求（messages 里带图片/音频/视频这类非文本 content-part）
+    单独换一套算法。`recovered.prompt_tokens` 是 estimate_tokens() 按字符数估算出来的，只数
+    文本内容——非文本 content-part 没有对应的字符数可数，直接拿这个估算值当 prompt_tokens
+    会严重偏小，不可信。改用减法：续写腿（final_leg_usage 来自真实下游）自己上报的
+    prompt_tokens 是真实分词结果，天然包含了原始多模态内容的真实 token 数，但也包含了作为
+    continue_final_message 前缀拼进去的那段 reasoning+content 文本（`recovered.
+    total_recovered` 正是这段前缀的估算 token 数）——把它减掉，剩下的就是对原始 prompt 真实
+    token 数的还原，不再依赖对图片这类内容做字符数估算。非多模态请求维持原来的估算值，不受
+    这条分支影响。"""
     completion_tokens = final_leg_usage.get("completion_tokens", 0) + recovered.total_recovered
     reasoning_tokens = final_leg_usage.get("reasoning_tokens", 0) + recovered.reasoning_tokens
-    prompt_tokens = recovered.prompt_tokens
+    if is_multimodal:
+        prompt_tokens = max(0, final_leg_usage.get("prompt_tokens", 0) - recovered.total_recovered)
+    else:
+        prompt_tokens = recovered.prompt_tokens
     total_tokens = prompt_tokens + completion_tokens
 
     corrected = {
@@ -110,14 +123,16 @@ def correct_usage(recovered: RecoveredTokens, final_leg_usage: dict) -> dict:
     return corrected
 
 
-def rewrite_leg2_line(line: bytes, recovered: RecoveredTokens, response_id: Optional[str]) -> bytes:
+def rewrite_leg2_line(line: bytes, recovered: RecoveredTokens, response_id: Optional[str],
+                       is_multimodal: bool = False) -> bytes:
     """续写腿逐行转发时用：两件事都在这一行原地做——①带 usage 的那条 data 行替换成修正后
     的值；②把 id 改写回 leg1 的原始 response_id。续写腿是网关自己发起的第二个下游请求，
     下游会给它分配一个全新的 completion id，如果不改写，客户端会在同一个响应流里看到 id
     中途变了（大多数 OpenAI 兼容客户端假设一个流式响应从头到尾只有一个 id，中途变化容易
     被当成异常，也会让"客户端和网关日志对上是哪个请求"这件事失去一个本该天然存在的锚点）。
     response_id 为 None（理论上不该发生，leg1 至少一个 chunk 才会走到续写）时不改写 id，
-    只做 usage 修正，其余字段原样透传。
+    只做 usage 修正，其余字段原样透传。is_multimodal 原样透传给 correct_usage()，决定
+    prompt_tokens 走估算值还是从真实 leg2 prompt_tokens 减算，见该函数顶部注释。
     """
     if not line.startswith(b"data:"):
         return line
@@ -133,7 +148,7 @@ def rewrite_leg2_line(line: bytes, recovered: RecoveredTokens, response_id: Opti
         obj["id"] = response_id
         changed = True
     if obj.get("usage"):
-        obj["usage"] = correct_usage(recovered, obj["usage"])
+        obj["usage"] = correct_usage(recovered, obj["usage"], is_multimodal)
         changed = True
     if not changed:
         return line
