@@ -1,7 +1,9 @@
-"""本地冒烟测试：不连真实集群，起一个假 downstream（模拟 SGLang）+ 真的 continuation_gateway
-服务，用 aiohttp client 打真实 HTTP 请求，验证网关机制本身对不对：卡住/断连能不能触发续写、
-tool_call 出现后是不是老实不救、第一个 chunk 都没等到时是不是彻底不介入（不重试、异常直接
-往上传）、usage 改写对不对、按 model 分派的前缀重建（XTML vs 通用 <think> 标签）对不对。
+"""本地冒烟测试：不连真实集群，起两个假 downstream（一个模拟 DOWNSTREAM_URL，一个模拟
+CONTINUATION_URL）+ 真的 continuation_gateway 服务，用 aiohttp client 打真实 HTTP 请求，
+验证网关机制本身对不对：卡住/断连能不能触发续写、tool_call 出现后是不是老实不救、第一个
+chunk 都没等到时是不是彻底不介入（不重试、异常直接往上传）、usage 改写对不对、按 model
+分派的前缀重建（XTML vs 通用 <think> 标签）对不对、续写请求是不是真的按 CONTINUATION_URL
+路由、CONTINUATION_ENABLED=False 时是不是只监测不真的发第二条腿。
 不验证"续写内容语义连不连贯"——那部分要在真实集群上验证，这里只测网关自己写的转发/编排代码。
 
 usage/max_tokens 扣减用到的 token 数不是靠 /v1/tokenize 现测的（这条集成已经被去掉了），是
@@ -36,8 +38,10 @@ from continuation_gateway.usage import estimate_tokens  # noqa: E402
 
 DOWNSTREAM_PORT = 18081
 GATEWAY_PORT = 18082
+CONTINUATION_DOWNSTREAM_PORT = 18083
 
 call_counts = {}  # scenario -> call count，用来分辨"这是第一条腿还是续写腿"
+continuation_call_counts = {}  # 独立的假 downstream，专门验证 CONTINUATION_URL 真的生效
 # upstream_disconnect_before_first_chunk 专用：网关这边的 task 被正确 cancel 会连带断掉
 # 它到这个假 downstream 的连接，这里的 asyncio.sleep 会被提前打断而设这个 event，而不是
 # 乖乖睡完——用它证明"客户端断连"这个信号真的传导到了网关正在等 leg1 第一个 chunk 的这个
@@ -296,6 +300,41 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
             }}))
             await resp.write(b"data: [DONE]\n\n")
 
+    elif scenario == "continuation_url_split":
+        # 这个 handler 扮演的是 DOWNSTREAM_URL（leg1 该走的那台）。leg2 应该被
+        # CONTINUATION_URL 导去 continuation_downstream_chat()，如果错误地又打回这里，
+        # call_n 会变成 2，下面的 assert 会抓到。
+        await resp.write(sse({"choices": [{"delta": {"content": "leg1 from primary downstream"}}]}))
+        await asyncio.sleep(5)
+        assert call_n == 1, "leg2 不该打回主 downstream，应该被 CONTINUATION_URL 导去别处"
+
+    elif scenario == "continuation_disabled_dry_run":
+        # CONTINUATION_ENABLED=False 时网关不该真的发第二条腿，只应该有这一次调用。
+        await resp.write(sse({"choices": [{"delta": {"content": "would need rescue but disabled"}}]}))
+        await asyncio.sleep(5)
+        assert call_n == 1, "CONTINUATION_ENABLED=False 时不该真的发 leg2"
+
+    await resp.write_eof()
+    return resp
+
+
+async def continuation_downstream_chat(request: web.Request) -> web.StreamResponse:
+    """独立于主 downstream 的假下游，只用来证明 CONTINUATION_URL 真的把续写请求导到了
+    这里而不是主 downstream——跟主 downstream 共用同一个端口就测不出"网关到底打了哪个
+    地址"这件事本身。"""
+    scenario = request.headers.get("X-Test-Scenario", "default")
+    body = await request.json()
+    continuation_call_counts[scenario] = continuation_call_counts.get(scenario, 0) + 1
+    assert body.get("continue_final_message") is True
+
+    resp = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+    await resp.prepare(request)
+    await resp.write(sse({"choices": [{"delta": {"content": " continued from continuation cluster."}}]}))
+    await resp.write(sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+    await resp.write(sse({"choices": [], "usage": {
+        "prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14, "reasoning_tokens": 0,
+    }}))
+    await resp.write(b"data: [DONE]\n\n")
     await resp.write_eof()
     return resp
 
@@ -311,6 +350,16 @@ async def run_downstream():
     runner = web.AppRunner(app, handler_cancellation=True)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", DOWNSTREAM_PORT)
+    await site.start()
+    return runner
+
+
+async def run_continuation_downstream():
+    app = web.Application(client_max_size=gw_config.MAX_REQUEST_BODY_BYTES)
+    app.router.add_post("/v1/chat/completions", continuation_downstream_chat)
+    runner = web.AppRunner(app, handler_cancellation=True)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", CONTINUATION_DOWNSTREAM_PORT)
     await site.start()
     return runner
 
@@ -378,6 +427,7 @@ async def call_gateway(scenario: str, model: str = "test-model", extra: dict = N
 
 async def main():
     downstream_runner = await run_downstream()
+    continuation_downstream_runner = await run_continuation_downstream()
     gateway_runner = await run_gateway()
     failures = []
 
@@ -580,6 +630,36 @@ async def main():
         check("exactly 1 downstream call per response_format case, 2 total (没有触发续写编排)",
               call_counts.get("response_format_passthrough") == 2)
 
+        print("\n== continuation_url_split (CONTINUATION_URL 把续写请求导去另一个地址) ==")
+        original_continuation_url = gw_config.CONTINUATION_URL
+        gw_config.CONTINUATION_URL = f"http://127.0.0.1:{CONTINUATION_DOWNSTREAM_PORT}"
+        try:
+            r = await call_gateway("continuation_url_split")
+        finally:
+            gw_config.CONTINUATION_URL = original_continuation_url
+        print("  ", r)
+        check("content merged across leg1 (primary) + leg2 (continuation cluster)",
+              r["content"] == "leg1 from primary downstream continued from continuation cluster.",
+              r["content"])
+        check("finish_reason present", r["finish_reason"] == "stop")
+        check("leg2 landed on the continuation downstream, not the primary one",
+              continuation_call_counts.get("continuation_url_split") == 1)
+
+        print("\n== continuation_disabled_dry_run "
+              "(CONTINUATION_ENABLED=False 时只监测 leg1、不真的发续写) ==")
+        original_continuation_enabled = gw_config.CONTINUATION_ENABLED
+        gw_config.CONTINUATION_ENABLED = False
+        try:
+            r = await call_gateway("continuation_disabled_dry_run")
+        finally:
+            gw_config.CONTINUATION_ENABLED = original_continuation_enabled
+        print("  ", r)
+        check("client still sees leg1's partial content (leg1 监测/转发不受影响)",
+              r["content"] == "would need rescue but disabled", r["content"])
+        check("no finish_reason (leg2 确实没有发生)", r["finish_reason"] is None)
+        check("only 1 downstream call (确认真的没有发第二条腿)",
+              call_counts.get("continuation_disabled_dry_run") == 1)
+
         print("\n== fault_injection_stall (续写阶段内部意外抛异常，网关不能崩) ==")
 
         def _boom(model, reasoning, content):
@@ -621,6 +701,7 @@ async def main():
 
     finally:
         await gateway_runner.cleanup()
+        await continuation_downstream_runner.cleanup()
         await downstream_runner.cleanup()
 
     print(f"\n{'='*60}\n{'ALL PASS' if not failures else 'FAILURES: ' + ', '.join(failures)}")

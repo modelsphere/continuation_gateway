@@ -3,12 +3,25 @@ import os
 DOWNSTREAM_URL = os.environ.get("DOWNSTREAM_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "8000"))
 
+# 续写请求（leg2）打去哪个地址——不设置就跟 DOWNSTREAM_URL 一样，只有明确要把续写流量导到
+# 另一个集群/服务（比如验证续写机制不占用主链路容量、或者续写用一个规格不同的备用集群）时
+# 才需要单独配置。原始请求（leg1，不管最终是走纯转发还是进了续写覆盖）永远打 DOWNSTREAM_URL，
+# 只有真的判定要救、发出去的那条续写请求走这个。
+CONTINUATION_URL = (os.environ.get("CONTINUATION_URL", "").rstrip("/") or DOWNSTREAM_URL)
+
 # 前缀重建按 model 分派（见 reconstruct.py），只对这里列出的 model 名字触发续写，其余 model
 # 原样透传。不设置时默认空集合——即什么都不触发，逼着部署时显式声明。大小写不敏感（存小写，
 # 匹配时也把请求里的 model 转小写），避免客户端传的大小写跟这里配置的不一致导致漏判。
 CONTINUATION_MODELS = {
     m.strip().lower() for m in os.environ.get("CONTINUATION_MODELS", "").split(",") if m.strip()
 }
+
+# 关掉之后网关仍然完整做 leg1 的监测（idle timeout/断连检测、TRIGGERED 判定和留痕都不受
+# 影响），只是不真的发第二条腿——用来在不给下游集群增加真实续写请求负载的前提下，验证"这条
+# 监测链路本身有没有打通"（能不能正确识别出该救的场景、日志/告警链路走不走得通）。默认打开，
+# 不设置这个变量时行为和只有 DOWNSTREAM_URL 一个环境变量的版本完全一致。
+CONTINUATION_ENABLED = os.environ.get("CONTINUATION_ENABLED", "true").strip().lower() not in (
+    "false", "0", "no", "off")
 
 # 第一个 chunk 等多久都不归这一层管——迟迟没有第一个 chunk 不算"卡住"，是不是要重试是上层
 # 的事，不属于续写范畴（没有已经吐给客户端的内容，没什么好救的）。idle timeout 只在收到过

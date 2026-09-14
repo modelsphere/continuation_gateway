@@ -18,7 +18,7 @@ Kimi-K3 崩溃续写网关：流式响应中途卡住（idle timeout）或断连
 
 ## 运行
 
-下游预期是一个机房/集群路由网关（不是直连某个具体 SGLang 实例），原始请求和续写请求打
+下游预期是一个机房/集群路由网关（不是直连某个具体 SGLang 实例），原始请求和续写请求默认打
 同一个 URL：
 
 ```bash
@@ -26,9 +26,12 @@ DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODELS=<Kimi-K3 的 mod
     python -m continuation_gateway.server
 ```
 
-可选环境变量（默认值见 `continuation_gateway/config.py`）：`PORT`、
-`STALL_IDLE_TIMEOUT_SECONDS`、`CONNECT_TIMEOUT_SECONDS`、`MAX_CONTINUATION_BODY_MB`、
-`MAX_REQUEST_BODY_MB`、`CJK_CHARS_PER_TOKEN`、`OTHER_CHARS_PER_TOKEN`。
+可选环境变量（默认值见 `continuation_gateway/config.py`）：`PORT`、`CONTINUATION_URL`
+（续写请求单独打去另一个地址，不设置就跟 `DOWNSTREAM_URL` 一样）、`CONTINUATION_ENABLED`
+（默认 `true`；设成 `false` 时网关仍然完整做 leg1 的监测/TRIGGERED 判定和留痕，只是不真的
+发第二条腿，用于验证监测链路本身、不给下游增加真实续写负载）、`STALL_IDLE_TIMEOUT_SECONDS`、
+`CONNECT_TIMEOUT_SECONDS`、`MAX_CONTINUATION_BODY_MB`、`MAX_REQUEST_BODY_MB`、
+`CJK_CHARS_PER_TOKEN`、`OTHER_CHARS_PER_TOKEN`。
 
 ## 测试
 

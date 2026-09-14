@@ -21,11 +21,16 @@ thinking-partial，多模态请求——带图片/音频/视频这类非文本�
 usage.py `correct_usage()` 顶部注释。这条判断跟大 body 排除（MAX_CONTINUATION_BODY_MB）
 互不影响——多模态请求如果 body 超限，仍然会被那条规则挡在续写范畴外，两条规则各管各的。
 
-跑法（下游预期是一个机房/集群路由网关，不是直连某个具体 SGLang 实例；原始请求和续写请求打
-同一个 URL，实例选择/避开故障实例交给下游网关负责，这一层不自己维护 SGLang 实例列表）：
+跑法（下游预期是一个机房/集群路由网关，不是直连某个具体 SGLang 实例；实例选择/避开故障实例
+交给下游网关负责，这一层不自己维护 SGLang 实例列表）：
 
     DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODELS=<Kimi-K3 的 model 名字> \\
         python -m continuation_gateway.server
+
+原始请求和续写请求默认打同一个 URL，可以用 CONTINUATION_URL 单独把续写请求（leg2）导到另一
+个地址；CONTINUATION_ENABLED=false 可以关掉"真的发第二条腿"这一步，只保留 leg1 的监测和
+TRIGGERED 留痕，两者都是可选的，默认值跟只有 DOWNSTREAM_URL 一个环境变量的版本行为一致，
+具体语义见 config.py 对应变量的注释。
 
 usage 修正 / max_tokens 扣减用到的 token 数不是靠 /v1/tokenize 现测的（下游不想为这个改
 服务，且 messages 模式在 Kimi-K3 部署上一直有已知问题），是按字符数估算的，见 usage.py
@@ -220,20 +225,31 @@ async def relay(downstream_content, out: web.StreamResponse, state: StreamState,
     SSE 行解析更新 state。
 
     idle timeout 本身不代表"该结束这条腿"——它只在"接下来有机会做一次有意义的续写"时才是
-    一个值得停下来的信号，也就是要同时满足：还没见过 tool_call、且已经攒到了可恢复的
-    reasoning/content。不满足这两条时（tool_call 已经出现，或者目前为止还什么实质内容都
-    没有），idle timeout 只是又白等了一轮，继续等——跟没有这层网关时下游只是慢一样，不应该
-    被这一层主动挂断，等下去仍然有机会等到内容。真正的断连/干净 EOF 不管当前是什么状态都会
-    结束这个循环，因为已经没有字节可读了，继续等没有意义，这个终点和没有网关时一致（普通
-    转发这时候也会结束）。
+    一个值得停下来的信号，也就是要同时满足三个条件：还没见过 tool_call、已经攒到了可恢复的
+    reasoning/content、且 CONTINUATION_ENABLED 确实打开着。不满足这三条中任何一条时
+    （tool_call 已经出现，或者目前为止还什么实质内容都没有，或者续写这个动作本身被关掉了），
+    idle timeout 只是又白等了一轮，继续等——跟没有这层网关时下游只是慢一样，不应该被这一层
+    主动挂断，等下去仍然有机会等到内容。CONTINUATION_ENABLED=false 这一条尤其要小心：这个
+    判断必须留在这里（挂不挂断 leg1 这一步），不能只在 guarded() 里判断"要不要发 leg2"——
+    如果这里不管这个开关，效果会是"检测到能救的场景就照常把 leg1 掐断，掐断之后才发现不该
+    真的去救"，客户端平白无故被断流却什么都没被救回来，比完全没有这层网关时更差，跟这个
+    开关本该提供的"只监测、不改变 leg1 实际行为"这个语义正好相反。真正的断连/干净 EOF 不管
+    当前是什么状态都会结束这个循环，因为已经没有字节可读了，继续等没有意义，这个终点和没有
+    网关时一致（普通转发这时候也会结束）。
 
     返回 (needs_retry, stall_reason)：needs_retry 为 True 表示这条腿结束时已经转发过至少
     一个 chunk、但还没见过 finish_reason，调用方据此决定要不要续写；第一个 chunk 就干净
     EOF（downstream 一个字节都没吐）时 needs_retry 为 False，不算需要续写，此时 stall_reason
-    是 None。`req_id` 用于每次 idle timeout 触发时打日志——不管这次超时最终是"继续等"还是
-    "交给上层决定要不要续写"，都统一在这里留一行标记，不是只有前者才值得记；这时候
-    `state.response_id` 大概率已经从第一个 chunk 里解析出来了，优先用它（跟客户端能看到的
-    completion id 对上号），解析不出来才退回用这个兜底 id。
+    是 None。`state.response_id` 大概率已经从第一个 chunk 里解析出来了，日志优先用它（跟
+    客户端能看到的 completion id 对上号），解析不出来才退回用 `req_id` 这个兜底值。
+
+    "继续等"这两个分支（not actionable / would-trigger-but-disabled）各自只在**第一次**
+    进入时打一行日志，同一条腿后续再命中同一个分支不重复打——这条腿最终是 FAILED 还是
+    SUCCEEDED（或者 SKIPPED/COMPLETED）会在 guarded()/attempt_continuation() 里留下明确
+    结论性的一行，"卡了多久/卡了几次"这种过程细节没必要靠这里重复刷屏来体现，尤其是集群
+    真的不稳定、一堆请求同时卡住的时候，每个 idle timeout 周期都打一行会让日志量随卡住
+    时长线性增长，反而淹没了"到底有几个请求卡住了"这个更重要的信号。"交给上层决定"这个
+    分支不需要去重——它每次命中都直接 return，同一条腿的同一次停顿不可能重复触发它。
     """
     chunk = await downstream_content.readany()
     if not chunk:
@@ -242,6 +258,8 @@ async def relay(downstream_content, out: web.StreamResponse, state: StreamState,
     for line in splitter.feed(chunk):
         feed_line(line, state)
 
+    logged_not_actionable = False
+    logged_disabled_would_trigger = False
     while True:
         stall_reason = []
         async for chunk in timed_reads(downstream_content, config.STALL_IDLE_TIMEOUT_SECONDS, stall_reason):
@@ -252,16 +270,31 @@ async def relay(downstream_content, out: web.StreamResponse, state: StreamState,
         has_recoverable = not state.tool_calls_seen and (state.reasoning or state.content)
         if reason.startswith("idle timeout"):
             log_id = state.response_id or req_id
-            if has_recoverable:
+            if has_recoverable and config.CONTINUATION_ENABLED:
                 # 这次超时是"可以做点什么"的那种——留一行标记这个事件本身发生过，具体决定
-                # 续不续写由 guarded() 的 TRIGGERED 日志接着记，这里不重复那份细节。
+                # 续不续写由 guarded() 的 TRIGGERED 日志接着记，这里不重复那份细节。这个
+                # 分支每次命中都直接 return（见下），不需要去重。
                 log.info("[continuation req=%s] leg1 idle timeout (%s), handing off for "
                          "continuation decision", log_id, reason)
+            elif has_recoverable:
+                # 有可恢复内容、但续写这个动作本身被 CONTINUATION_ENABLED=false 关掉了——
+                # 不挂断 leg1（挂断之后什么都救不回来，纯粹是白白断流），跟"没有可恢复内容"
+                # 一样继续等；只在第一次命中时打一行，证明"检测/判定这一步确实正常工作"
+                # （这行会打出来），跟"这次请求根本没遇到能救的场景"（不会打出这行）区分开，
+                # 这个区分才是验证监测链路时真正关心的信号，重复刷同一行没有额外信息量。
+                if not logged_disabled_would_trigger:
+                    log.warning("[continuation req=%s] leg1 stalled (%s), would trigger "
+                                "continuation but CONTINUATION_ENABLED=false, continuing "
+                                "to wait", log_id, reason)
+                    logged_disabled_would_trigger = True
+                continue
             else:
-                log.warning("[continuation req=%s] leg1 stalled (%s) but not actionable "
-                            "(tool_calls_seen=%s, has_content=%s), continuing to wait",
-                            log_id, reason, state.tool_calls_seen,
-                            bool(state.reasoning or state.content))
+                if not logged_not_actionable:
+                    log.warning("[continuation req=%s] leg1 stalled (%s) but not actionable "
+                                "(tool_calls_seen=%s, has_content=%s), continuing to wait",
+                                log_id, reason, state.tool_calls_seen,
+                                bool(state.reasoning or state.content))
+                    logged_not_actionable = True
                 continue
         return state.finish_reason is None, reason
 
@@ -276,9 +309,11 @@ async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: Line
 
     单次续写策略下这条腿没有第三条腿可退，所以 idle timeout 在这里不该再有"结束这条腿"的
     效果——停下来也换不来任何补救动作，唯一自洽的选择是跟没有这层网关时一样继续等（下游
-    真的只是慢的话，等下去仍然有机会把流正常说完）；每次 idle timeout 只打一行 warning 留痕
-    （方便观测下游到底卡了多久、卡了几次），不代表放弃。真正的断连/干净 EOF 才会让这条腿
-    结束，因为已经没有字节可读了，等也没用，这个终点和没有网关时一致。
+    真的只是慢的话，等下去仍然有机会把流正常说完）；只在第一次卡住时打一行 warning 留痕，
+    不代表放弃，同一条腿后续再卡住不重复打——这条腿最终是 SUCCEEDED 还是 FAILED 会在
+    attempt_continuation() 里留下结论性的一行，卡了多久/卡了几次这种过程细节没必要靠这里
+    重复刷屏来体现。真正的断连/干净 EOF 才会让这条腿结束，因为已经没有字节可读了，等也
+    没用，这个终点和没有网关时一致。
 
     返回 (outcome, finished)：outcome 是这条腿结束的原因，纯粹给调用方打日志用；finished
     是有没有在结束前见过 finish_reason——单靠 outcome 的文字（比如"clean EOF"）分不清
@@ -295,6 +330,7 @@ async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: Line
         feed_line(line, state)
         await out.write(rewrite_leg2_line(line, recovered, response_id, is_multimodal) + b"\n")
 
+    logged_stall = False
     while True:
         stall_reason = []
         async for chunk in timed_reads(downstream_content, config.STALL_IDLE_TIMEOUT_SECONDS, stall_reason):
@@ -303,8 +339,10 @@ async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: Line
                 await out.write(rewrite_leg2_line(line, recovered, response_id, is_multimodal) + b"\n")
         reason = stall_reason[0]
         if reason.startswith("idle timeout"):
-            log.warning("[continuation req=%s] leg2 stalled (%s), no third leg, continuing to wait",
-                        log_id, reason)
+            if not logged_stall:
+                log.warning("[continuation req=%s] leg2 stalled (%s), no third leg, continuing "
+                            "to wait", log_id, reason)
+                logged_stall = True
             continue
         return reason, state.finish_reason is not None
 
@@ -417,6 +455,11 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
     req_id = uuid.uuid4().hex[:8]
     session: ClientSession = request.app["session"]
     target = config.DOWNSTREAM_URL + request.path_qs
+    # leg1 永远打 DOWNSTREAM_URL；只有真的判定要救、attempt_continuation() 发出去的续写请求
+    # 才走 CONTINUATION_URL（不设置的话两者是同一个地址，见 config.py 里的注释）。这里先
+    # 算出来、needs_retry 分支才用到，是为了让 target/continuation_target 这两个"发去哪"的
+    # 决定都在函数一开始就固定下来，不用在分支深处现算。
+    continuation_target = config.CONTINUATION_URL + request.path_qs
     headers = filter_headers(request.headers)
 
     try:
@@ -509,17 +552,30 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
             # v1 范围排除：已经出现过 tool_call chunk，不在网关能安全处理的范围内，不救。
             log.warning("[continuation req=%s] SKIPPED reason=tool_call_seen", log_id)
         elif state.reasoning or state.content:
-            try:
-                await attempt_continuation(session, target, headers, payload, state, out, log_id)
-            except Exception:
-                # 这是网关层，这里再崩会把已经转发给客户端的部分也带没了、甚至可能影响到
-                # 同一个 worker 上别的请求；续写本身是"锦上添花"，救不回来不该拖累已经稳妥
-                # 转发出去的正文。这里兜的是"意料之外"的错误（比如构造续写 payload 时的
-                # 意外类型错误、客户端在续写腿写入过程中断开连接）。不用担心吞掉
-                # asyncio.CancelledError——Python 3.8+ 它是 BaseException 的子类，不会被
-                # `except Exception` 捕获，正常取消/关闭流程不受影响。
-                log.exception("[continuation req=%s] FAILED reason=unexpected_exception case=%s",
-                              log_id, case)
+            if not config.CONTINUATION_ENABLED:
+                # 上面的 TRIGGERED 已经如实记录了"这条请求本该被救"这个判定结果——
+                # CONTINUATION_ENABLED=false 只影响接下来这一步要不要真的发第二条腿，不影响
+                # 判定本身，也不影响 leg1 的监测（idle timeout/断连检测都在 relay() 里，跟这
+                # 个开关无关）。用跟 tool_call_seen/no_recoverable_content 同一套 SKIPPED
+                # 格式记录，方便复用同一份关联/统计工具，不需要额外识别一种新的日志形状；
+                # 这个分支必须放在"确实有 reasoning/content 可恢复"判断之后，不然没有实际
+                # 内容可救的请求（该落 no_recoverable_content 的那种）会被这个开关抢先截胡，
+                # 把"本来就没什么好救的"误记成"因为开关关了才没救"。
+                log.info("[continuation req=%s] SKIPPED reason=continuation_disabled case=%s",
+                          log_id, case)
+            else:
+                try:
+                    await attempt_continuation(session, continuation_target, headers, payload,
+                                                state, out, log_id)
+                except Exception:
+                    # 这是网关层，这里再崩会把已经转发给客户端的部分也带没了、甚至可能影响到
+                    # 同一个 worker 上别的请求；续写本身是"锦上添花"，救不回来不该拖累已经
+                    # 稳妥转发出去的正文。这里兜的是"意料之外"的错误（比如构造续写 payload 时
+                    # 的意外类型错误、客户端在续写腿写入过程中断开连接）。不用担心吞掉
+                    # asyncio.CancelledError——Python 3.8+ 它是 BaseException 的子类，不会被
+                    # `except Exception` 捕获，正常取消/关闭流程不受影响。
+                    log.exception("[continuation req=%s] FAILED reason=unexpected_exception case=%s",
+                                  log_id, case)
         else:
             # 收到过 chunk 但没有任何可用的 reasoning/content（比如只有一个空白的角色声明
             # chunk），没有实际内容可救，不属于续写范畴，流按原样收尾。
@@ -580,8 +636,10 @@ def main():
     # /health 必须在 catch_all 的通配路由之前注册，否则会被 catch_all 透传到下游。
     app.router.add_get("/health", health)
     app.router.add_route("*", "/{tail:.*}", catch_all)
-    log.info("listening on 0.0.0.0:%d, forwarding to %s (continuation models: %s)",
-              config.PORT, config.DOWNSTREAM_URL, config.CONTINUATION_MODELS or "<none configured>")
+    log.info("listening on 0.0.0.0:%d, forwarding to %s, continuation requests to %s "
+              "(continuation models: %s, continuation enabled: %s)",
+              config.PORT, config.DOWNSTREAM_URL, config.CONTINUATION_URL,
+              config.CONTINUATION_MODELS or "<none configured>", config.CONTINUATION_ENABLED)
     # handler_cancellation=True：aiohttp 的默认值是 False，默认值下客户端断连时
     # RequestHandler.connection_lost() 不会 cancel 正在处理这个请求的 task（读
     # aiohttp/web_protocol.py 源码确认，`_task_handler.cancel()` 那行套在
