@@ -40,6 +40,7 @@ usage 修正 / max_tokens 扣减用到的 token 数不是靠 /v1/tokenize 现测
 import asyncio
 import json
 import logging
+import signal
 import sys
 import time
 import uuid
@@ -616,7 +617,61 @@ async def catch_all(request: web.Request) -> web.StreamResponse:
     return await passthrough(request)
 
 
+class _InflightCounter:
+    __slots__ = ("value", "logger_task")
+
+    def __init__(self):
+        self.value = 0
+        self.logger_task = None
+
+
+@web.middleware
+async def track_inflight(request: web.Request, handler):
+    # 纯计数，只给 on_shutdown() 打日志用——不影响请求处理本身。收到 SIGTERM 时能看到"当时
+    # 还有几个请求在处理"，之后遇到重启才能一眼分辨这是正常 drain 完退出，还是被 SIGKILL/
+    # OOM 之类强杀（那种情况下这里的日志根本来不及打出来），不用再靠猜的。
+    # 存的是一个可变对象、改的是这个对象自己的属性，而不是 request.app["inflight"] = ...
+    # 那种直接给 app 这个映射重新赋值——aiohttp 新版本里应用跑起来之后再对它 __setitem__
+    # 会报 DeprecationWarning（"Changing state of started or joined application is
+    # deprecated"，以后大概率变成硬错误），只读 app["inflight"]（__getitem__）取出这个对象
+    # 不受影响。
+    counter: _InflightCounter = request.app["inflight"]
+    counter.value += 1
+    try:
+        return await handler(request)
+    finally:
+        counter.value -= 1
+
+
+def _log_signal_and_exit(signal_name: str) -> None:
+    # main() 里 web.run_app(handle_signals=False)，SIGINT/SIGTERM 不再由 aiohttp 内部的
+    # _raise_graceful_exit 处理——自己接管纯粹是为了能在 raise 之前先打一条明确写着"收到的是
+    # 哪个信号"的日志：aiohttp 默认那条路径对 SIGINT/SIGTERM 用的是同一个 handler，事后从
+    # on_shutdown() 里完全看不出触发关闭的到底是哪个信号，排查/在测试集群验证时不够直接。
+    # web.GracefulExit 是 aiohttp 公开导出的类型（GracefulExit(SystemExit)），run_app() 自己
+    # 走的默认路径也是靠 raise 这个来触发同一套"关监听 -> 等在途请求 -> cleanup"流程，这里
+    # 只是在它前面插一条日志，关闭流程本身和默认行为完全一致。
+    log.info("received %s, no longer accepting new connections, "
+              "draining in-flight requests before exit", signal_name)
+    raise web.GracefulExit()
+
+
 async def on_startup(app: web.Application):
+    # inflight 计数器和它的中间件都在这里装配（而不是要求调用方在 web.Application(...)
+    # 构造时就传 middlewares=[track_inflight] 再另外设 app["inflight"] = ...）——
+    # on_startup/on_cleanup 是作为一对被复用的（tests/smoke_test.py 就是直接拿这两个函数
+    # 装到它自己手搭的 Application 上，并不知道 track_inflight 这个内部实现细节），少一处
+    # 要调用方配合的地方就少一处忘记同步的风险；这里跟 app.middlewares.append(...) 一样，
+    # 要在 app 被冻结（开始真正处理请求）之前做完，跟下面这些 add_signal_handler/建
+    # ClientSession 是同一个时机，没有额外要求。
+    app["inflight"] = _InflightCounter()
+    app.middlewares.append(track_inflight)
+    loop = asyncio.get_running_loop()
+    for sig, name in ((signal.SIGTERM, "SIGTERM"), (signal.SIGINT, "SIGINT")):
+        try:
+            loop.add_signal_handler(sig, _log_signal_and_exit, name)
+        except NotImplementedError:  # pragma: no cover - Windows 不支持，这里跑在容器里用不到
+            pass
     app["session"] = ClientSession(
         auto_decompress=False,
         connector=TCPConnector(limit=config.DOWNSTREAM_CONNECTION_LIMIT),
@@ -624,13 +679,53 @@ async def on_startup(app: web.Application):
     )
 
 
+async def _log_remaining_inflight_periodically(counter: _InflightCounter):
+    # 只在 on_shutdown() 真的发现还有在途请求时才会被起来跑（见下面调用处的 if 判断），drain
+    # 完/没什么可 drain 就不存在这个 task，平时零开销。存在的意义：drain 现在没有固定上限
+    # （可能等到 1 小时），中途只有 on_shutdown 那一条"起点快照"日志的话，等待期间完全看不出
+    # 这是在正常收尾还是卡死了，只能等事后翻每个请求自己的访问日志倒推。这里每 5s 报一次还
+    # 剩几个，等待过程本身就是可观测的，不用等结束才知道。
+    while True:
+        await asyncio.sleep(5)
+        remaining = counter.value
+        if remaining == 0:
+            log.info("in-flight requests drained")
+            return
+        log.info("still draining %d in-flight request(s)...", remaining)
+
+
+async def on_shutdown(app: web.Application):
+    # 触发时机：监听端口已经关闭（不会再有新连接进来），即将开始等在途请求跑完——见
+    # config.GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS 顶部注释，None 就是真的不设上限地等。
+    counter: _InflightCounter = app["inflight"]
+    timeout_desc = (f"up to {config.GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS:.0f}s"
+                    if config.GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS else "indefinitely")
+    log.info("draining %d in-flight request(s), will wait %s before forcing close",
+              counter.value, timeout_desc)
+    if counter.value > 0:
+        # 挂在 counter 自己身上（而不是 app["logger_task"] = ...）——同样是为了不在 app 启动
+        # 之后再对它 __setitem__，见 track_inflight() 里那条同类注释。
+        counter.logger_task = asyncio.create_task(_log_remaining_inflight_periodically(counter))
+
+
 async def on_cleanup(app: web.Application):
+    counter: _InflightCounter = app["inflight"]
+    if counter.logger_task is not None and not counter.logger_task.done():
+        # 正常情况下这个 task 会在计数归零时自己退出；只有 shutdown_timeout 到期强制断开了
+        # 还没跑完的连接（GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS 设了有限值时才可能发生）才会走到
+        # 这里，收个尾，避免进程退出时留一个还在 sleep 的 task 产生 "never retrieved" 一类警告。
+        counter.logger_task.cancel()
+        try:
+            await counter.logger_task
+        except asyncio.CancelledError:
+            pass
     await app["session"].close()
 
 
 def main():
     app = web.Application(client_max_size=config.MAX_REQUEST_BODY_BYTES)
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
     app.on_cleanup.append(on_cleanup)
     app.router.add_post("/v1/chat/completions", chat_completions)
     # /health 必须在 catch_all 的通配路由之前注册，否则会被 catch_all 透传到下游。
@@ -652,7 +747,14 @@ def main():
     # `aiohttp.test_utils.TestServer` 内部默认就是 `handler_cancellation=True`，如果这里
     # 不显式设置，本地冒烟测试（用真实 `web.AppRunner`，不是 `test_utils`）跟生产环境用的
     # 会是两个不同的默认值，测试"验证过"的行为不能代表生产的真实行为。
-    web.run_app(app, host="0.0.0.0", port=config.PORT, print=None, handler_cancellation=True)
+    # handle_signals=False：SIGINT/SIGTERM 自己在 on_startup() 里接管（_log_signal_and_exit），
+    # 只是为了在触发关闭前先打一条明确写着"收到的是哪个信号"的日志，关闭流程本身（停止接受
+    # 新连接 -> 等在途请求跑完 -> cleanup）跟 aiohttp 默认路径完全一样。shutdown_timeout 决定
+    # "等在途请求跑完"这一步最多等多久，见 config.GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS 顶部注释
+    # （当前是 None，无限等待，跟部署清单里 terminationGracePeriodSeconds=1 小时的兜底上限
+    # 配套）。
+    web.run_app(app, host="0.0.0.0", port=config.PORT, print=None, handler_cancellation=True,
+                handle_signals=False, shutdown_timeout=config.GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS)
 
 
 if __name__ == "__main__":

@@ -16,5 +16,7 @@ EXPOSE 8000
 #      DOWNSTREAM_URL 一样）、CONTINUATION_ENABLED（默认 true；设成 false 只监测 leg1、
 #      不真的发续写请求）、STALL_IDLE_TIMEOUT_SECONDS、CONNECT_TIMEOUT_SECONDS、
 #      DOWNSTREAM_CONNECTION_LIMIT、MAX_CONTINUATION_BODY_MB、MAX_REQUEST_BODY_MB、
-#      CJK_CHARS_PER_TOKEN、OTHER_CHARS_PER_TOKEN（默认值见 config.py）。
+#      CJK_CHARS_PER_TOKEN、OTHER_CHARS_PER_TOKEN、GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
+#      （默认值见 config.py）。GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS 默认不设置=收到 SIGTERM
+#      后无限等在途请求跑完，兜底上限由部署清单里的 terminationGracePeriodSeconds 负责。
 CMD ["python3", "-m", "continuation_gateway.server"]

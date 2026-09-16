@@ -65,3 +65,15 @@ MAX_REQUEST_BODY_BYTES = MAX_REQUEST_BODY_MB * 1024 * 1024
 # 校准过的精确值，如果后续拿到真实样本可以调整这两个默认值。
 CJK_CHARS_PER_TOKEN = float(os.environ.get("CJK_CHARS_PER_TOKEN", "1.6"))
 OTHER_CHARS_PER_TOKEN = float(os.environ.get("OTHER_CHARS_PER_TOKEN", "4.0"))
+
+# 收到 SIGTERM（k8s 删除/滚动更新 pod 时先发这个）之后，aiohttp 的 web.run_app() 会自动停止
+# 监听新连接，然后等现有请求跑完再退出——"最多等多久"这个上限就是这个值，传给
+# web.run_app(shutdown_timeout=...)。当前版本的设计意图是老老实实等所有在途请求自然结束，
+# 不主动截断（部署清单里 terminationGracePeriodSeconds 已经配成 1 小时，真正的兜底上限由
+# k8s 那边兜，到点了会直接 SIGKILL，这里不用也不该再重复设一个更短的人为上限跟它打架）。
+# 空字符串/不设置 = 无限等待——传 None 给 aiohttp 会让它用 async_timeout.timeout(None)，
+# 真正意义上的不设超时，不是"设一个很大的数"那种近似。
+# 后续如果改成"关闭时把还在处理的请求转发/推给续写服务，而不是在本地死等"，这里大概率会
+# 需要换成一个有限值，把这个开关留着方便到时候切换，不用再改调用方代码。
+_shutdown_timeout_raw = os.environ.get("GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS", "").strip()
+GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = float(_shutdown_timeout_raw) if _shutdown_timeout_raw else None
