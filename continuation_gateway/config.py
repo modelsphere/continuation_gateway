@@ -23,6 +23,18 @@ CONTINUATION_MODELS = {
 CONTINUATION_ENABLED = os.environ.get("CONTINUATION_ENABLED", "true").strip().lower() not in (
     "false", "0", "no", "off")
 
+# tool_call 暂存策略：打开后，leg1 上一旦出现带 tool_calls 的 chunk，就把这一个 chunk 和之后
+# 的所有 chunk 暂存在网关内存里不转发，等到 tool_call 全部吐完（收到 finish_reason，或流已经
+# 以 [DONE] 收尾）再一次性放给客户端。目的是让"tool_call 已经流给客户端"这种没法续写的状态
+# 不会发生——continue_final_message 的语义下 tool_calls 代表这一轮已经说完，客户端拿到
+# 一半 tool_call 之后 SGLang 没法接着往下续。暂存期间如果 leg1 卡住/断连，暂存的 tool_call
+# 整批丢弃，state 里的 reasoning/content 正好停在第一个 tool_call chunk 之前，按普通的
+# thinking-partial/content-done 续写；续写腿之后重新生成（可能又是一个 tool_call）。
+# 代价：tool_call 的参数不再逐 chunk 流式到达客户端，而是在 tool_call 完成后一次性到达，
+# 且暂存内容在网关内存里停留到 tool_call 结束。默认关闭，此时行为跟没有这个功能时完全一致。
+BUFFER_TOOL_CALLS = os.environ.get("BUFFER_TOOL_CALLS", "false").strip().lower() in (
+    "true", "1", "yes", "on")
+
 # 第一个 chunk 等多久都不归这一层管——迟迟没有第一个 chunk 不算"卡住"，是不是要重试是上层
 # 的事，不属于续写范畴（没有已经吐给客户端的内容，没什么好救的）。idle timeout 只在收到过
 # 至少一个 chunk 之后才生效，见 server.py 的 relay()/relay_leg2()。

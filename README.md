@@ -10,7 +10,9 @@ Kimi-K3 崩溃续写网关：流式响应中途卡住（idle timeout）或断连
 `continuation_gateway/server.py` 里 `should_intervene()` 的注释：
 
 - 已经出现过 tool_call chunk 才崩的：`continue_final_message` 标准语义下没有"tool 还在
-  生成中"的状态位，要支持需要改 SGLang 源码。
+  生成中"的状态位，要支持需要改 SGLang 源码。可以用 `BUFFER_TOOL_CALLS=true`（见下）绕开
+  这个限制：tool_call chunk 在网关内暂存、完整后才放给客户端，崩溃时整批丢弃并按 tool_call
+  出现之前的状态续写，客户端从来没收到过 tool_call，也就不存在"续不上"的状态。
 - `response_format` 是 `json_object`/`json_schema` 的结构化输出：约束到的 JSON 内容混在
   普通 content chunk 里，没有独立信号能识别。
 - 客户端自己发的 `continue_final_message` 请求：不再叠加续写。
@@ -32,6 +34,13 @@ DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODELS=<Kimi-K3 的 mod
 发第二条腿，用于验证监测链路本身、不给下游增加真实续写负载）、`STALL_IDLE_TIMEOUT_SECONDS`、
 `CONNECT_TIMEOUT_SECONDS`、`MAX_CONTINUATION_BODY_MB`、`MAX_REQUEST_BODY_MB`、
 `CJK_CHARS_PER_TOKEN`、`OTHER_CHARS_PER_TOKEN`。
+
+`BUFFER_TOOL_CALLS`（默认 `false`，关闭时行为不变）：leg1 上出现带 `tool_calls` 的 chunk 后，
+这一个 chunk 和之后的所有行都暂存在网关内存里，直到收到 `finish_reason`（或 `[DONE]`）再一次性
+转发。暂存期间卡住/断连时，暂存内容整批丢弃，按第一个 tool_call chunk 之前的
+thinking-partial/content-done 状态续写（续写腿重新生成，可能又是一个 tool_call）。没有可恢复
+内容、或 `CONTINUATION_ENABLED=false` 等不会真的续写的情况，暂存内容原样放给客户端。代价：
+tool_call 参数不再逐 chunk 流式到达，而是在 tool_call 完成后一次性到达。
 
 ## 测试
 

@@ -148,6 +148,91 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
         await asyncio.sleep(5)  # 卡住，但 v1 范围排除 tool_call，网关不该发第二条腿
         assert call_n == 1, "不该有第二次调用"
 
+    elif scenario == "hold_tool_call_normal":
+        # BUFFER_TOOL_CALLS 打开：tool_call 的两个 chunk（名字、参数）之间和之后都隔着一段
+        # 停顿，客户端在 finish_reason 到达之前不该收到任何 tool_call chunk。
+        await resp.write(sse({"id": "chatcmpl-h", "choices": [{"delta": {"content": "calling. "}}]}))
+        await resp.write(sse({"id": "chatcmpl-h", "choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "x:0", "type": "function", "function": {"name": "f", "arguments": ""}}
+        ]}}]}))
+        await asyncio.sleep(0.3)
+        await resp.write(sse({"id": "chatcmpl-h", "choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": "{\"a\": 1}"}}
+        ]}}]}))
+        await asyncio.sleep(0.3)
+        await resp.write(sse({"id": "chatcmpl-h", "choices": [{"delta": {}, "finish_reason": "tool_calls"}]}))
+        await resp.write(sse({"id": "chatcmpl-h", "choices": [], "usage": {
+            "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}}))
+        await resp.write(b"data: [DONE]\n\n")
+        assert call_n == 1
+
+    elif scenario in ("hold_tool_call_stall_discard", "hold_tool_call_disconnect_discard"):
+        with_content = scenario == "hold_tool_call_stall_discard"
+        if call_n == 1:
+            await resp.write(sse({"id": "chatcmpl-leg1", "choices": [{"delta": {"reasoning_content": "thinking. "}}]}))
+            if with_content:
+                await resp.write(sse({"id": "chatcmpl-leg1", "choices": [{"delta": {"content": "I will call a tool. "}}]}))
+            # 第一个 tool_call chunk 里还混了 content：暂存期间它不该进入 state，续写前缀里不该出现。
+            await resp.write(sse({"id": "chatcmpl-leg1", "choices": [{"delta": {
+                "content": "LEAKED", "tool_calls": [
+                    {"index": 0, "id": "x:0", "type": "function",
+                     "function": {"name": "f", "arguments": "{\"from\": \"leg1\"}"}}]}}]}))
+            if with_content:
+                await asyncio.sleep(5)  # 卡住，触发 idle timeout
+            else:
+                await resp.write_eof()
+                resp.force_close()
+                raise ConnectionResetError("simulated crash after tool_call chunk")
+        else:
+            assert body.get("continue_final_message") is True
+            prefix = body["messages"][-1]["content"]
+            assert "LEAKED" not in prefix and "leg1" not in prefix, prefix
+            if with_content:
+                assert prefix == "<think>thinking. </think>I will call a tool. ", prefix
+                assert body.get("chat_template_kwargs") == {"thinking": False}
+            else:
+                assert prefix == "<think>thinking. ", prefix
+                assert body.get("chat_template_kwargs") is None
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "y:0", "type": "function",
+                 "function": {"name": "f", "arguments": "{\"from\": \"leg2\"}"}}]}}]}))
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [{"delta": {}, "finish_reason": "tool_calls"}]}))
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [], "usage": {
+                "prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55, "reasoning_tokens": 0}}))
+            await resp.write(b"data: [DONE]\n\n")
+
+    elif scenario in ("hold_tool_call_no_content_release", "hold_tool_call_continuation_disabled"):
+        # 没有可恢复内容 / 续写被关：暂存的 tool_call 不会被丢弃，流结束时原样放给客户端。
+        if scenario == "hold_tool_call_continuation_disabled":
+            await resp.write(sse({"id": "chatcmpl-r", "choices": [{"delta": {"content": "some text. "}}]}))
+        await resp.write(sse({"id": "chatcmpl-r", "choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "x:0", "type": "function", "function": {"name": "f", "arguments": "{\"from\": \"leg1\"}"}}
+        ]}}]}))
+        await asyncio.sleep(1.5)
+        assert call_n == 1, "不该发出第二条腿"
+
+    elif scenario in ("reasoning_field_vllm_to_sglang", "reasoning_field_sglang_to_vllm"):
+        # leg1 和 leg2 用不同的思考字段名（模拟 leg1 是 vLLM、续写腿被路由到 SGLang，或反过来）。
+        # 网关必须①从 leg1 的字段名里正确累积 reasoning（前缀里要有）；②把 leg2 的字段名改写成 leg1 的。
+        leg1_field, leg2_field = (("reasoning", "reasoning_content")
+                                  if scenario == "reasoning_field_vllm_to_sglang"
+                                  else ("reasoning_content", "reasoning"))
+        if call_n == 1:
+            await resp.write(sse({"choices": [{"delta": {leg1_field: "step one. "}}]}))
+            await resp.write(sse({"choices": [{"delta": {leg1_field: "step two"}}]}))
+            await resp.write_eof()
+            resp.force_close()
+            raise ConnectionResetError("simulated crash mid-stream")
+        else:
+            assert body["messages"][-1]["content"] == "<think>step one. step two", body["messages"][-1]["content"]
+            # SGLang 在非思考 chunk 里会带 "reasoning_content": null，改写后也不该凭空丢内容或出错。
+            await resp.write(sse({"choices": [{"delta": {leg2_field: " step three."}}]}))
+            await resp.write(sse({"choices": [{"delta": {"content": "done.", leg2_field: None}}]}))
+            await resp.write(sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+            await resp.write(sse({"choices": [], "usage": {
+                "prompt_tokens": 500, "completion_tokens": 5, "total_tokens": 505, "reasoning_tokens": 3}}))
+            await resp.write(b"data: [DONE]\n\n")
+
     elif scenario == "role_only_disconnect":
         # 只吐一个空白的角色声明 chunk（没有 reasoning、没有 content、没有 tool_calls），
         # 然后直接断连——leg1 确实收到过 chunk（needs_retry 会是 True，TRIGGERED 会打出来），
@@ -391,6 +476,8 @@ async def call_gateway(scenario: str, model: str = "test-model", extra: dict = N
     if extra:
         payload.update(extra)
     reasoning, content, finish_reason, usage, ids = [], [], None, None, []
+    tool_call_args, first_tool_call_at, finish_at = [], None, None
+    reasoning_fields = set()  # 客户端实际看到的思考字段名（只统计有非空文本的）
     aborted = False
     async with ClientSession(timeout=ClientTimeout(total=15)) as client:
         async with client.post(f"http://127.0.0.1:{GATEWAY_PORT}/v1/chat/completions",
@@ -411,18 +498,27 @@ async def call_gateway(scenario: str, model: str = "test-model", extra: dict = N
                         usage = obj["usage"]
                     for ch in obj.get("choices", []):
                         d = ch.get("delta", {})
-                        if d.get("reasoning_content"):
-                            reasoning.append(d["reasoning_content"])
+                        for name in ("reasoning_content", "reasoning"):
+                            if d.get(name):
+                                reasoning.append(d[name])
+                                reasoning_fields.add(name)
                         if d.get("content"):
                             content.append(d["content"])
+                        for tc in d.get("tool_calls") or []:
+                            if first_tool_call_at is None:
+                                first_tool_call_at = time.monotonic()
+                            tool_call_args.append((tc.get("function") or {}).get("arguments", ""))
                         if ch.get("finish_reason"):
                             finish_reason = ch["finish_reason"]
+                            finish_at = time.monotonic()
             except (ClientPayloadError, ServerDisconnectedError, ConnectionResetError):
                 # 网关侧异常应该原样往上传，客户端这里应该真的看到连接被异常中断——
                 # 这正是 no_chunk_disconnect 场景要验证的行为，不是测试的 bug。
                 aborted = True
     return {"status": status, "reasoning": "".join(reasoning), "content": "".join(content),
-            "finish_reason": finish_reason, "usage": usage, "aborted": aborted, "ids": ids}
+            "finish_reason": finish_reason, "usage": usage, "aborted": aborted, "ids": ids,
+            "tool_call_args": "".join(tool_call_args), "first_tool_call_at": first_tool_call_at,
+            "finish_at": finish_at, "reasoning_fields": reasoning_fields}
 
 
 async def main():
@@ -679,6 +775,78 @@ async def main():
               not r["aborted"])
         check("only 1 downstream chat call (从没成功发出续写请求)",
               call_counts.get("fault_injection_stall") == 1)
+
+        for scenario, leg1_field in (("reasoning_field_vllm_to_sglang", "reasoning"),
+                                     ("reasoning_field_sglang_to_vllm", "reasoning_content")):
+            print(f"\n== {scenario} (leg1 用 {leg1_field}，续写腿字段名不同，要改写成 leg1 的) ==")
+            r = await call_gateway(scenario)
+            print("  ", r)
+            check("reasoning recovered from leg1's field and continued by leg2",
+                  r["reasoning"] == "step one. step two step three.", r["reasoning"])
+            check("client only ever sees leg1's reasoning field name",
+                  r["reasoning_fields"] == {leg1_field}, r["reasoning_fields"])
+            check("content from leg2", r["content"] == "done.", r["content"])
+            check("2 downstream calls (leg1 reasoning was recoverable, 触发了续写)",
+                  call_counts.get(scenario) == 2)
+            check("usage reasoning_tokens includes recovered reasoning",
+                  r["usage"]["reasoning_tokens"] == 3 + est("step one. step two"), r["usage"])
+
+        print("\n== BUFFER_TOOL_CALLS=True 场景 ==")
+        gw_config.BUFFER_TOOL_CALLS = True
+        try:
+            print("\n-- hold_tool_call_normal (tool_call 暂存到 finish_reason 才一起放出) --")
+            r = await call_gateway("hold_tool_call_normal")
+            print("  ", r)
+            check("content before tool_call forwarded", r["content"] == "calling. ", r["content"])
+            check("tool_call arguments intact after release", r["tool_call_args"] == '{"a": 1}', r["tool_call_args"])
+            check("finish_reason present", r["finish_reason"] == "tool_calls")
+            check("usage passed through untouched", r["usage"]["prompt_tokens"] == 7, r["usage"])
+            # 下游在 tool_call 第一个 chunk 后 0.6s 才发 finish_reason；不暂存的话客户端会在
+            # 这之前很早就收到 tool_call，暂存的话两者几乎同时到达。
+            gap = r["finish_at"] - r["first_tool_call_at"]
+            check("tool_call chunks released together with finish_reason (not streamed early)",
+                  gap < 0.2, f"gap={gap:.3f}s")
+            check("only 1 downstream call", call_counts.get("hold_tool_call_normal") == 1)
+
+            print("\n-- hold_tool_call_stall_discard (tool_call 暂存期间卡住 -> 丢弃 -> content-done 续写) --")
+            r = await call_gateway("hold_tool_call_stall_discard")
+            print("  ", r)
+            check("client never saw leg1's tool_call, only leg2's",
+                  r["tool_call_args"] == '{"from": "leg2"}', r["tool_call_args"])
+            check("content from the discarded tool_call chunk not leaked to client",
+                  r["content"] == "I will call a tool. ", r["content"])
+            check("finish_reason from leg2", r["finish_reason"] == "tool_calls")
+            check("2 downstream calls (leg1 + leg2)", call_counts.get("hold_tool_call_stall_discard") == 2)
+            check("id stays leg1's", r["ids"] and all(i == "chatcmpl-leg1" for i in r["ids"]), r["ids"])
+
+            print("\n-- hold_tool_call_disconnect_discard (tool_call 后断连 -> 丢弃 -> thinking-partial 续写) --")
+            r = await call_gateway("hold_tool_call_disconnect_discard")
+            print("  ", r)
+            check("client never saw leg1's tool_call, only leg2's",
+                  r["tool_call_args"] == '{"from": "leg2"}', r["tool_call_args"])
+            check("reasoning preserved, no leaked content",
+                  r["reasoning"] == "thinking. " and r["content"] == "", (r["reasoning"], r["content"]))
+            check("finish_reason from leg2", r["finish_reason"] == "tool_calls")
+            check("2 downstream calls", call_counts.get("hold_tool_call_disconnect_discard") == 2)
+
+            print("\n-- hold_tool_call_no_content_release (没有可恢复内容 -> 不续写，暂存内容原样放出) --")
+            r = await call_gateway("hold_tool_call_no_content_release")
+            print("  ", r)
+            check("held tool_call released unchanged", r["tool_call_args"] == '{"from": "leg1"}', r["tool_call_args"])
+            check("only 1 downstream call", call_counts.get("hold_tool_call_no_content_release") == 1)
+
+            print("\n-- hold_tool_call_continuation_disabled (CONTINUATION_ENABLED=False -> 暂存内容原样放出) --")
+            gw_config.CONTINUATION_ENABLED = False
+            try:
+                r = await call_gateway("hold_tool_call_continuation_disabled")
+            finally:
+                gw_config.CONTINUATION_ENABLED = True
+            print("  ", r)
+            check("content forwarded", r["content"] == "some text. ", r["content"])
+            check("held tool_call released unchanged", r["tool_call_args"] == '{"from": "leg1"}', r["tool_call_args"])
+            check("only 1 downstream call", call_counts.get("hold_tool_call_continuation_disabled") == 1)
+        finally:
+            gw_config.BUFFER_TOOL_CALLS = False
 
         print("\n== 非 continuation model：纯透传，不触发任何续写逻辑 ==")
         r = await call_gateway("passthrough_check", model="some-other-model")

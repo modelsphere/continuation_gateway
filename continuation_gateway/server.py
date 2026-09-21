@@ -5,7 +5,9 @@ thinking-partial，多模态请求——带图片/音频/视频这类非文本�
 
 - tool_call：`continue_final_message` 标准语义下 `tool_calls` 字段代表"这轮已经说完、该
   tool 角色回复了"，没有"还在生成中"的状态位，要支持得改 SGLang 源码，这里不做（这条崩溃时
-  才能发现，出现过 tool_call chunk 就不再救）。
+  才能发现，出现过 tool_call chunk 就不再救）。BUFFER_TOOL_CALLS=true 时改成另一套：tool_call
+  chunk 在网关内暂存、tool_call 完整后才转发给客户端，崩溃时暂存内容整批丢弃，按 tool_call
+  出现之前的 thinking-partial/content-done 续写，见 config.py 和 sse.feed_line_holding()。
 - response_format 是 json_object/json_schema 的结构化输出：不打算改 SGLang 支持（跟
   tool_call 不同，这条纯粹是不想做），而且被约束的 JSON 内容混在普通 content chunk 里流
   出来，跟自由文本没有独立信号能区分，网关这层要单独识别"这段 content 其实是被 guided
@@ -58,7 +60,7 @@ from aiohttp import (
 
 from . import config
 from .reconstruct import build_prefix, classify_case, needs_thinking_disabled
-from .sse import LineSplitter, StreamState, feed_line
+from .sse import LineSplitter, StreamState, feed_line, feed_line_holding
 from .usage import estimate_recovered_tokens, rewrite_leg2_line
 
 if not config.DOWNSTREAM_URL:
@@ -217,6 +219,24 @@ async def passthrough(request: web.Request, raw_body: bytes = None) -> web.Strea
     return await _stream_downstream_verbatim(request, downstream)
 
 
+async def _forward_leg1_chunk(chunk: bytes, out: web.StreamResponse, state: StreamState,
+                               splitter: LineSplitter) -> None:
+    """leg1 收到的一块字节：默认原样转发并喂给 SSE 解析；BUFFER_TOOL_CALLS 打开时改成逐行
+    处理，tool_call 相关的行先暂存在 state.held_lines 里（见 sse.feed_line_holding()），
+    只转发当下可以放行的行。逐行重新拼接的字节跟原始字节等价（每行补回 \n），唯一区别是
+    不完整的半行要等到行尾到达才转发，对 SSE 客户端没有影响。"""
+    if not config.BUFFER_TOOL_CALLS:
+        await out.write(chunk)
+        for line in splitter.feed(chunk):
+            feed_line(line, state)
+        return
+    ready = []
+    for line in splitter.feed(chunk):
+        ready.extend(feed_line_holding(line, state))
+    if ready:
+        await out.write(b"".join(line + b"\n" for line in ready))
+
+
 async def relay(downstream_content, out: web.StreamResponse, state: StreamState,
                  splitter: LineSplitter, req_id: str) -> tuple:
     """原始腿：先无限等第一个 chunk——这一层不对"迟迟没有第一个 chunk"这件事负责，等多久、
@@ -255,18 +275,14 @@ async def relay(downstream_content, out: web.StreamResponse, state: StreamState,
     chunk = await downstream_content.readany()
     if not chunk:
         return False, None
-    await out.write(chunk)
-    for line in splitter.feed(chunk):
-        feed_line(line, state)
+    await _forward_leg1_chunk(chunk, out, state, splitter)
 
     logged_not_actionable = False
     logged_disabled_would_trigger = False
     while True:
         stall_reason = []
         async for chunk in timed_reads(downstream_content, config.STALL_IDLE_TIMEOUT_SECONDS, stall_reason):
-            await out.write(chunk)
-            for line in splitter.feed(chunk):
-                feed_line(line, state)
+            await _forward_leg1_chunk(chunk, out, state, splitter)
         reason = stall_reason[0]
         has_recoverable = not state.tool_calls_seen and (state.reasoning or state.content)
         if reason.startswith("idle timeout"):
@@ -301,7 +317,8 @@ async def relay(downstream_content, out: web.StreamResponse, state: StreamState,
 
 
 async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: LineSplitter, recovered,
-                      response_id: str, log_id: str, is_multimodal: bool = False) -> tuple:
+                      response_id: str, log_id: str, is_multimodal: bool = False,
+                      reasoning_field: str = None) -> tuple:
     """续写腿：逐行转发（不是整块字节透传），因为带 usage 的那条 data 行、以及每一行的 id
     都要原地改写（id 改写见 usage.py:rewrite_leg2_line 顶部注释——续写腿是网关自己发起的
     新请求，下游会分配一个新 completion id，不改写的话客户端会看到 id 中途变化）。同样先
@@ -329,7 +346,8 @@ async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: Line
         return "clean EOF before first chunk", False
     for line in splitter.feed(chunk):
         feed_line(line, state)
-        await out.write(rewrite_leg2_line(line, recovered, response_id, is_multimodal) + b"\n")
+        await out.write(rewrite_leg2_line(line, recovered, response_id, is_multimodal,
+                                                             reasoning_field) + b"\n")
 
     logged_stall = False
     while True:
@@ -337,7 +355,8 @@ async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: Line
         async for chunk in timed_reads(downstream_content, config.STALL_IDLE_TIMEOUT_SECONDS, stall_reason):
             for line in splitter.feed(chunk):
                 feed_line(line, state)
-                await out.write(rewrite_leg2_line(line, recovered, response_id, is_multimodal) + b"\n")
+                await out.write(rewrite_leg2_line(line, recovered, response_id, is_multimodal,
+                                                             reasoning_field) + b"\n")
         reason = stall_reason[0]
         if reason.startswith("idle timeout"):
             if not logged_stall:
@@ -416,7 +435,8 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
     splitter = LineSplitter()
     try:
         leg2_outcome, leg2_finished = await relay_leg2(downstream.content, out, splitter, recovered,
-                                                         state.response_id, log_id, is_multimodal)
+                                                         state.response_id, log_id, is_multimodal,
+                                                         state.reasoning_field)
     finally:
         downstream.release()
     if leg2_finished:
@@ -546,9 +566,10 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
         # 状态，不因为最终没续写就不打。
         case = classify_case(state.tool_calls_seen, state.reasoning, state.content)
         log.info("[continuation req=%s] TRIGGERED reason=%s case=%s reasoning_chars=%d "
-                  "content_chars=%d tool_calls_seen=%s model=%s",
+                  "content_chars=%d tool_calls_seen=%s held_tool_call_lines=%d model=%s",
                   log_id, stall_reason, case, len(state.reasoning),
-                  len(state.content), state.tool_calls_seen, payload.get("model"))
+                  len(state.content), state.tool_calls_seen, len(state.held_lines),
+                  payload.get("model"))
         if state.tool_calls_seen:
             # v1 范围排除：已经出现过 tool_call chunk，不在网关能安全处理的范围内，不救。
             log.warning("[continuation req=%s] SKIPPED reason=tool_call_seen", log_id)
@@ -565,6 +586,16 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
                 log.info("[continuation req=%s] SKIPPED reason=continuation_disabled case=%s",
                           log_id, case)
             else:
+                if state.held_lines:
+                    # BUFFER_TOOL_CALLS：暂存的 tool_call 客户端从没收到过，续写要从第一个
+                    # tool_call chunk 之前的状态（state.reasoning/content 在暂存期间没有被
+                    # 更新）重新生成，直接整批丢掉。tool_call 相关 chunk 里如果混有
+                    # reasoning/content 也一并丢——它们不在 state 里，续写前缀里没有，
+                    # 续写腿会重新生成，不会造成重复。
+                    held_lines, held_bytes = state.discard_held_tool_calls()
+                    log.info("[continuation req=%s] TOOL_CALL_DISCARDED held_lines=%d held_bytes=%d, "
+                              "continuing from the state before the first tool_call chunk case=%s",
+                              log_id, held_lines, held_bytes, case)
                 try:
                     await attempt_continuation(session, continuation_target, headers, payload,
                                                 state, out, log_id)
@@ -592,6 +623,14 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
                   log_id, stall_reason or "clean EOF on first read")
 
     try:
+        if state.held_lines:
+            # 暂存的 tool_call 没被丢弃（没有走到续写：没有可恢复内容、续写被关闭等），
+            # 原样放给客户端，效果跟没开 BUFFER_TOOL_CALLS 时一致，不因为暂存而凭空丢数据。
+            log.info("[continuation req=%s] releasing %d held tool_call line(s) to the client "
+                      "unchanged (no continuation attempted)", state.response_id or req_id,
+                      len(state.held_lines))
+            await out.write(b"".join(line + b"\n" for line in state.held_lines))
+            state.held_lines = []
         await out.write_eof()
     except Exception:
         # 到这一步该做的都做完了，客户端这时候如果已经断开，收尾失败不算真正的错误，

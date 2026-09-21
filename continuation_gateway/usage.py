@@ -18,6 +18,8 @@ import math
 import re
 from typing import Optional
 
+from .sse import REASONING_FIELDS
+
 _CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힣豈-﫿]")
 
 
@@ -124,7 +126,7 @@ def correct_usage(recovered: RecoveredTokens, final_leg_usage: dict, is_multimod
 
 
 def rewrite_leg2_line(line: bytes, recovered: RecoveredTokens, response_id: Optional[str],
-                       is_multimodal: bool = False) -> bytes:
+                       is_multimodal: bool = False, reasoning_field: Optional[str] = None) -> bytes:
     """续写腿逐行转发时用：两件事都在这一行原地做——①带 usage 的那条 data 行替换成修正后
     的值；②把 id 改写回 leg1 的原始 response_id。续写腿是网关自己发起的第二个下游请求，
     下游会给它分配一个全新的 completion id，如果不改写，客户端会在同一个响应流里看到 id
@@ -133,6 +135,11 @@ def rewrite_leg2_line(line: bytes, recovered: RecoveredTokens, response_id: Opti
     response_id 为 None（理论上不该发生，leg1 至少一个 chunk 才会走到续写）时不改写 id，
     只做 usage 修正，其余字段原样透传。is_multimodal 原样透传给 correct_usage()，决定
     prompt_tokens 走估算值还是从真实 leg2 prompt_tokens 减算，见该函数顶部注释。
+
+    reasoning_field 是 leg1 里思考内容用的字段名（见 sse.StreamState.reasoning_field）：
+    续写腿可能被路由到另一种推理后端（SGLang 叫 reasoning_content，vLLM 叫 reasoning），
+    这里把 delta 里的另一个名字改写成 leg1 的，保证客户端在同一个流里看到的字段名前后一致。
+    None（leg1 没出现过思考内容）时不改写。
     """
     if not line.startswith(b"data:"):
         return line
@@ -147,6 +154,17 @@ def rewrite_leg2_line(line: bytes, recovered: RecoveredTokens, response_id: Opti
     if response_id and obj.get("id") and obj["id"] != response_id:
         obj["id"] = response_id
         changed = True
+    if reasoning_field:
+        other = next(n for n in REASONING_FIELDS if n != reasoning_field)
+        for ch in obj.get("choices") or []:
+            delta = ch.get("delta")
+            if isinstance(delta, dict) and other in delta:
+                value = delta.pop(other)
+                # 目标字段已经存在且有内容时不覆盖（同一个 delta 里不会同时出现两个名字，
+                # 这只是防御，避免丢内容）。
+                if not delta.get(reasoning_field):
+                    delta[reasoning_field] = value
+                changed = True
     if obj.get("usage"):
         obj["usage"] = correct_usage(recovered, obj["usage"], is_multimodal)
         changed = True

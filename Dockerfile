@@ -13,7 +13,8 @@ EXPOSE 8000
 #   DOWNSTREAM_URL       下游路由网关地址，例如 http://172.26.3.82:8050
 #   CONTINUATION_MODELS  逗号分隔的 Kimi-K3 model 名字，不设置就默认空集合、什么都不触发
 # 可选：PORT（默认 8000）、CONTINUATION_URL（续写请求单独打去另一个地址，不设置就跟
-#      DOWNSTREAM_URL 一样）、CONTINUATION_ENABLED（默认 true；设成 false 只监测 leg1、
+#      DOWNSTREAM_URL 一样）、BUFFER_TOOL_CALLS（默认 false；true 时 tool_call chunk 暂存到完整后才转发，崩溃时丢弃暂存内容
+#      并按 tool_call 出现之前的状态续写）、CONTINUATION_ENABLED（默认 true；设成 false 只监测 leg1、
 #      不真的发续写请求）、STALL_IDLE_TIMEOUT_SECONDS、CONNECT_TIMEOUT_SECONDS、
 #      DOWNSTREAM_CONNECTION_LIMIT、MAX_CONTINUATION_BODY_MB、MAX_REQUEST_BODY_MB、
 #      CJK_CHARS_PER_TOKEN、OTHER_CHARS_PER_TOKEN、GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
