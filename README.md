@@ -35,12 +35,17 @@ DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODELS=<Kimi-K3 的 mod
 `CONNECT_TIMEOUT_SECONDS`、`MAX_CONTINUATION_BODY_MB`、`MAX_REQUEST_BODY_MB`、
 `CJK_CHARS_PER_TOKEN`、`OTHER_CHARS_PER_TOKEN`。
 
-`BUFFER_TOOL_CALLS`（默认 `false`，关闭时行为不变）：leg1 上出现带 `tool_calls` 的 chunk 后，
-这一个 chunk 和之后的所有行都暂存在网关内存里，直到收到 `finish_reason`（或 `[DONE]`）再一次性
-转发。暂存期间卡住/断连时，暂存内容整批丢弃，按第一个 tool_call chunk 之前的
-thinking-partial/content-done 状态续写（续写腿重新生成，可能又是一个 tool_call）。没有可恢复
-内容、或 `CONTINUATION_ENABLED=false` 等不会真的续写的情况，暂存内容原样放给客户端。代价：
+`BUFFER_TOOL_CALLS`（默认 `false`，关闭时行为不变；只在 `CONTINUATION_ENABLED=true` 时才会
+真的生效，见下）：leg1 上出现带 `tool_calls` 的 chunk 后，这一个 chunk 和之后的所有行都暂存在
+网关内存里，直到收到 `finish_reason`（或 `[DONE]`）再一次性转发。暂存期间卡住/断连时，暂存
+内容整批丢弃，按第一个 tool_call chunk 之前的 thinking-partial/content-done 状态续写（续写腿
+重新生成，可能又是一个 tool_call）。没有可恢复内容的情况，暂存内容原样放给客户端。代价：
 tool_call 参数不再逐 chunk 流式到达，而是在 tool_call 完成后一次性到达。
+
+`CONTINUATION_ENABLED=false` 是 `BUFFER_TOOL_CALLS` 生效的大前提：暂存唯一的目的是保住续写
+的可行性，续写这个动作本身被关掉之后暂存不会换来任何补救，只会让 tool_call 参数白白多等一轮
+才到达客户端，所以这个组合下网关直接跳过暂存、按普通透传处理，跟没打开 `BUFFER_TOOL_CALLS`
+时行为一致。
 
 ## 测试
 

@@ -32,6 +32,10 @@ CONTINUATION_ENABLED = os.environ.get("CONTINUATION_ENABLED", "true").strip().lo
 # thinking-partial/content-done 续写；续写腿之后重新生成（可能又是一个 tool_call）。
 # 代价：tool_call 的参数不再逐 chunk 流式到达客户端，而是在 tool_call 完成后一次性到达，
 # 且暂存内容在网关内存里停留到 tool_call 结束。默认关闭，此时行为跟没有这个功能时完全一致。
+#
+# CONTINUATION_ENABLED 是这个开关生效的大前提（见 server.py _forward_leg1_chunk()）：
+# CONTINUATION_ENABLED=false 时即使这里是 true 也不会真的暂存——暂存只是为了保住续写的
+# 可行性，续写这个动作本身都被关掉了，暂存除了让 tool_call 参数延迟到达之外没有任何用处。
 BUFFER_TOOL_CALLS = os.environ.get("BUFFER_TOOL_CALLS", "false").strip().lower() in (
     "true", "1", "yes", "on")
 

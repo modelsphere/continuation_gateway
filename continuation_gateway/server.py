@@ -224,8 +224,14 @@ async def _forward_leg1_chunk(chunk: bytes, out: web.StreamResponse, state: Stre
     """leg1 收到的一块字节：默认原样转发并喂给 SSE 解析；BUFFER_TOOL_CALLS 打开时改成逐行
     处理，tool_call 相关的行先暂存在 state.held_lines 里（见 sse.feed_line_holding()），
     只转发当下可以放行的行。逐行重新拼接的字节跟原始字节等价（每行补回 \n），唯一区别是
-    不完整的半行要等到行尾到达才转发，对 SSE 客户端没有影响。"""
-    if not config.BUFFER_TOOL_CALLS:
+    不完整的半行要等到行尾到达才转发，对 SSE 客户端没有影响。
+
+    CONTINUATION_ENABLED 是这里的大前提：暂存 tool_call 唯一的目的是保住续写的可行性（不让
+    客户端提前看到没法续写的半截 tool_call），CONTINUATION_ENABLED=false 时续写这个动作本身
+    已经被关掉了，暂存不会换来任何补救，只会白白让 tool_call 参数从逐 chunk 到达退化成一次性
+    到达——这跟 relay() 里 idle timeout 分支同一个道理（CONTINUATION_ENABLED=false 只监测、
+    不改变 leg1 实际行为），必须两个开关一起判断，不能让 BUFFER_TOOL_CALLS 单独生效。"""
+    if not (config.BUFFER_TOOL_CALLS and config.CONTINUATION_ENABLED):
         await out.write(chunk)
         for line in splitter.feed(chunk):
             feed_line(line, state)

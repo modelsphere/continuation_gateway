@@ -202,7 +202,10 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
             await resp.write(b"data: [DONE]\n\n")
 
     elif scenario in ("hold_tool_call_no_content_release", "hold_tool_call_continuation_disabled"):
-        # 没有可恢复内容 / 续写被关：暂存的 tool_call 不会被丢弃，流结束时原样放给客户端。
+        # 没有可恢复内容：暂存的 tool_call 不会被丢弃，流结束时原样放给客户端。
+        # 续写被 CONTINUATION_ENABLED=false 关掉：BUFFER_TOOL_CALLS 这时不生效（见
+        # server.py _forward_leg1_chunk()），tool_call 根本不会被暂存，直接照常透传给
+        # 客户端——对客户端来说最终收到的内容一样，只是不再经过"暂存再一次性放出"这一步。
         if scenario == "hold_tool_call_continuation_disabled":
             await resp.write(sse({"id": "chatcmpl-r", "choices": [{"delta": {"content": "some text. "}}]}))
         await resp.write(sse({"id": "chatcmpl-r", "choices": [{"delta": {"tool_calls": [
@@ -835,7 +838,7 @@ async def main():
             check("held tool_call released unchanged", r["tool_call_args"] == '{"from": "leg1"}', r["tool_call_args"])
             check("only 1 downstream call", call_counts.get("hold_tool_call_no_content_release") == 1)
 
-            print("\n-- hold_tool_call_continuation_disabled (CONTINUATION_ENABLED=False -> 暂存内容原样放出) --")
+            print("\n-- hold_tool_call_continuation_disabled (CONTINUATION_ENABLED=False -> 不暂存，直接照常转发) --")
             gw_config.CONTINUATION_ENABLED = False
             try:
                 r = await call_gateway("hold_tool_call_continuation_disabled")
