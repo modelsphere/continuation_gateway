@@ -6,10 +6,10 @@
 `corrected_prompt_tokens`/`corrected_completion/reasoning_tokens` 里"被救回的那部分"用字符数
 估算出 token 数，加到续写腿真实上报的 usage 上。
 
-token 数不再靠 /v1/tokenize 现测（下游不想为这个改服务，且 messages 模式在 Kimi-K3 部署上
-一直有已知问题），改成 estimate_tokens() 按字符数估算：CJK（中/日/韩）字符和其它字符分开算，
+token 数不再靠 /v1/tokenize 现测（避免对下游服务引入额外依赖，且并非所有部署的 tokenize
+接口都支持 messages 模式），改成 estimate_tokens() 按字符数估算：CJK（中/日/韩）字符和其它字符分开算，
 用两个经验比例（见 config.py 的 CJK_CHARS_PER_TOKEN / OTHER_CHARS_PER_TOKEN）换算成 token 数。
-这两个比例是通用经验值，不是针对 Kimi-K3 分词器实测校准过的，估算注定比真实分词有偏差——
+这两个比例是通用经验值，不是针对某个具体分词器校准过的，估算注定比真实分词有偏差——
 但这层本来就"只做加法、不追求绝对精确"，偏差是可接受的。
 """
 

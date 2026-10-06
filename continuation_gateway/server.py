@@ -1,4 +1,4 @@
-"""Kimi-K3 崩溃续写网关 —— v1 范围：只处理"崩溃时还没出现过 tool_call chunk、且请求本身没有
+"""崩溃续写网关 —— 范围：只处理"崩溃时还没出现过 tool_call chunk、且请求本身没有
 用 response_format 约束成 json_object/json_schema"的情况（普通自由文本的 content-done /
 thinking-partial，多模态请求——带图片/音频/视频这类非文本内容——也在覆盖范围内）。两类场景
 明确排除，都在 `should_intervene()`/`state.tool_calls_seen` 里挡掉：
@@ -16,8 +16,8 @@ thinking-partial，多模态请求——带图片/音频/视频这类非文本�
 
 多模态请求（messages 里带图片/音频/视频这类非文本 content-part）走跟纯文本请求相同的续写
 编排，但 usage 修正换了一套算法：usage.py 的 estimate_tokens() 只按字符数估算 token，对
-非文本内容没有对应的字符数可数，估算出来的 prompt_tokens 不可信（实测过真实 6 万多 token
-的图片请求，估算结果只有 12）；`_has_multimodal_content()` 判断出的结果会一路传到
+非文本内容没有对应的字符数可数，估算出来的 prompt_tokens 不可信（比如一条真实 prompt 有 6 万多
+token 的图片请求，估算结果只有 12）；`_has_multimodal_content()` 判断出的结果会一路传到
 `usage.correct_usage()`，多模态请求改用"续写腿真实上报的 prompt_tokens 减去被救回内容的
 估算 token 数"这种减法，而不是纯文本请求那套"估算值直接当 prompt_tokens"的算法，具体见
 usage.py `correct_usage()` 顶部注释。这条判断跟大 body 排除（MAX_CONTINUATION_BODY_MB）
@@ -26,7 +26,7 @@ usage.py `correct_usage()` 顶部注释。这条判断跟大 body 排除（MAX_C
 跑法（下游预期是一个机房/集群路由网关，不是直连某个具体 SGLang 实例；实例选择/避开故障实例
 交给下游网关负责，这一层不自己维护 SGLang 实例列表）：
 
-    DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODELS=<Kimi-K3 的 model 名字> \\
+    DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODELS=<model 名字> \\
         python -m continuation_gateway.server
 
 原始请求和续写请求默认打同一个 URL，可以用 CONTINUATION_URL 单独把续写请求（leg2）导到另一
@@ -34,8 +34,8 @@ usage.py `correct_usage()` 顶部注释。这条判断跟大 body 排除（MAX_C
 TRIGGERED 留痕，两者都是可选的，默认值跟只有 DOWNSTREAM_URL 一个环境变量的版本行为一致，
 具体语义见 config.py 对应变量的注释。
 
-usage 修正 / max_tokens 扣减用到的 token 数不是靠 /v1/tokenize 现测的（下游不想为这个改
-服务，且 messages 模式在 Kimi-K3 部署上一直有已知问题），是按字符数估算的，见 usage.py
+usage 修正 / max_tokens 扣减用到的 token 数不是靠 /v1/tokenize 现测的（避免对下游服务
+引入额外依赖，且并非所有部署的 tokenize 接口都支持 messages 模式），是按字符数估算的，见 usage.py
 顶部注释。
 """
 
@@ -64,7 +64,7 @@ from .sse import LineSplitter, StreamState, feed_line, feed_line_holding
 from .usage import estimate_recovered_tokens, rewrite_leg2_line
 
 if not config.DOWNSTREAM_URL:
-    sys.exit("Set DOWNSTREAM_URL, e.g. DOWNSTREAM_URL=http://172.26.3.82:8050 "
+    sys.exit("Set DOWNSTREAM_URL, e.g. DOWNSTREAM_URL=http://router.example.com:8050 "
              "python -m continuation_gateway.server")
 
 HOP_BY_HOP = {
@@ -382,7 +382,7 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
     # 不使用这个估算值——但这里仍然照常算出来、照常打进日志，方便跟减算结果对照排查。
     is_multimodal = _has_multimodal_content(original_payload)
     # case（见 reconstruct.classify_case()）到这一步已经是确定真的会发第二条腿之后的状态了
-    # （tool_call_seen/no_recoverable_content 两个排除分支已经在 guarded() 里过滤掉，v1
+    # （tool_call_seen/no_recoverable_content 两个排除分支已经在 guarded() 里过滤掉，当前
     # 范围内 state.tool_calls_seen 到这里必然是 False，传它只是让这次调用跟 classify_case()
     # 的完整签名保持一致——以后 v2 如果放开 tool_call 场景也能真的走到这个函数，这里不用改），
     # 目前实际只会落在 content-done/thinking-partial 二选一，直接决定了下面 build_prefix()
@@ -577,7 +577,7 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
                   len(state.content), state.tool_calls_seen, len(state.held_lines),
                   payload.get("model"))
         if state.tool_calls_seen:
-            # v1 范围排除：已经出现过 tool_call chunk，不在网关能安全处理的范围内，不救。
+            # 范围排除：已经出现过 tool_call chunk，不在网关能安全处理的范围内，不救。
             log.warning("[continuation req=%s] SKIPPED reason=tool_call_seen", log_id)
         elif state.reasoning or state.content:
             if not config.CONTINUATION_ENABLED:
@@ -692,7 +692,7 @@ def _log_signal_and_exit(signal_name: str) -> None:
     # main() 里 web.run_app(handle_signals=False)，SIGINT/SIGTERM 不再由 aiohttp 内部的
     # _raise_graceful_exit 处理——自己接管纯粹是为了能在 raise 之前先打一条明确写着"收到的是
     # 哪个信号"的日志：aiohttp 默认那条路径对 SIGINT/SIGTERM 用的是同一个 handler，事后从
-    # on_shutdown() 里完全看不出触发关闭的到底是哪个信号，排查/在测试集群验证时不够直接。
+    # on_shutdown() 里完全看不出触发关闭的到底是哪个信号，排查/在测试环境验证时不够直接。
     # web.GracefulExit 是 aiohttp 公开导出的类型（GracefulExit(SystemExit)），run_app() 自己
     # 走的默认路径也是靠 raise 这个来触发同一套"关监听 -> 等在途请求 -> cleanup"流程，这里
     # 只是在它前面插一条日志，关闭流程本身和默认行为完全一致。
@@ -790,14 +790,14 @@ def main():
     # 这个 task 当时卡在哪个 await 上（等 leg1 connect、等 leg1 数据、等 leg2 数据……）都会
     # 被尽快 cancel，不用再靠自己配的各种超时兜底。**这个参数也要跟测试环境保持一致**——
     # `aiohttp.test_utils.TestServer` 内部默认就是 `handler_cancellation=True`，如果这里
-    # 不显式设置，本地冒烟测试（用真实 `web.AppRunner`，不是 `test_utils`）跟生产环境用的
+    # 不显式设置，本地冒烟测试（用真实 `web.AppRunner`，不是 `test_utils`）跟实际部署用的
     # 会是两个不同的默认值，测试"验证过"的行为不能代表生产的真实行为。
     # handle_signals=False：SIGINT/SIGTERM 自己在 on_startup() 里接管（_log_signal_and_exit），
     # 只是为了在触发关闭前先打一条明确写着"收到的是哪个信号"的日志，关闭流程本身（停止接受
     # 新连接 -> 等在途请求跑完 -> cleanup）跟 aiohttp 默认路径完全一样。shutdown_timeout 决定
     # "等在途请求跑完"这一步最多等多久，见 config.GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS 顶部注释
-    # （当前是 None，无限等待，跟部署清单里 terminationGracePeriodSeconds=1 小时的兜底上限
-    # 配套）。
+    # （当前是 None，无限等待，由部署平台的优雅终止超时（如 Kubernetes 的
+    # terminationGracePeriodSeconds）兜底）。
     web.run_app(app, host="0.0.0.0", port=config.PORT, print=None, handler_cancellation=True,
                 handle_signals=False, shutdown_timeout=config.GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS)
 

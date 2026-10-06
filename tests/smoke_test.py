@@ -1,4 +1,4 @@
-"""本地冒烟测试：不连真实集群，起两个假 downstream（一个模拟 DOWNSTREAM_URL，一个模拟
+"""本地冒烟测试：不连真实下游集群，起两个假 downstream（一个模拟 DOWNSTREAM_URL，一个模拟
 CONTINUATION_URL）+ 真的 continuation_gateway 服务，用 aiohttp client 打真实 HTTP 请求，
 验证网关机制本身对不对：卡住/断连能不能触发续写、tool_call 出现后是不是老实不救、第一个
 chunk 都没等到时是不是彻底不介入（不重试、异常直接往上传）、usage 改写对不对、按 model
@@ -145,7 +145,7 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
         await resp.write(sse({"choices": [{"delta": {"tool_calls": [
             {"index": 0, "id": "x:0", "type": "function", "function": {"name": "f", "arguments": "{}"}}
         ]}}]}))
-        await asyncio.sleep(5)  # 卡住，但 v1 范围排除 tool_call，网关不该发第二条腿
+        await asyncio.sleep(5)  # 卡住，但 tool_call 不在续写范围内，网关不该发第二条腿
         assert call_n == 1, "不该有第二次调用"
 
     elif scenario == "hold_tool_call_normal":
@@ -578,7 +578,7 @@ async def main():
         check("content merged correctly", r["content"] == "k3 answer continued.", r["content"])
         check("finish_reason present", r["finish_reason"] == "stop")
 
-        print("\n== tool_call_seen_no_rescue (v1 范围排除，不救) ==")
+        print("\n== tool_call_seen_no_rescue (范围外，不救) ==")
         r = await call_gateway("tool_call_seen_no_rescue")
         print("  ", r)
         check("no finish_reason (流被卡住后老实结束，不续写)", r["finish_reason"] is None)

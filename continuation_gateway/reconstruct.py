@@ -5,7 +5,7 @@ sentinel token 方案），按 model 分派到各自的构造函数，见 _BUILD
 的通用写法，但不保证覆盖所有未来接入的模型，真遇到别的格式要在这里加一个专门的 builder，
 不要指望默认格式蒙对。
 
-v1 范围只覆盖自由文本、且崩溃时还没出现过 tool_call chunk 的情况，所以运行时只需要判断
+当前只覆盖自由文本、且崩溃时还没出现过 tool_call chunk 的情况，所以运行时只需要判断
 content 是否非空：非空说明 thinking 阶段已经结束（content-done），为空则保守按"可能还在
 thinking"处理（thinking-partial）——这条对所有 builder 都成立，不是 K3 专属。tool_call
 场景、以及 response_format 是 json_object/json_schema 的结构化输出场景，都在 server.py
@@ -68,7 +68,7 @@ def classify_case(tool_calls_seen: bool, reasoning: str, content: str) -> str:
     调用点大概率不用跟着改，日志格式也不用跟着重新设计。判断顺序按"证据强度"从高到低
     排列，不是随便哪个信号先判都行：
 
-    - "tool-call-seen"：已经出现过 tool_call chunk，最强信号，优先判。v1 范围这种情况
+    - "tool-call-seen"：已经出现过 tool_call chunk，最强信号，优先判。这种情况
       总是被 SKIPPED（见 server.py should_intervene 附近的排除逻辑，不会真的走到
       attempt_continuation()），但日志依然如实单独标注这一档，不能因为"反正会被排除"
       就随便套用下面几个不准确的标签——tool_calls_seen=True 时 reasoning/content 通常
