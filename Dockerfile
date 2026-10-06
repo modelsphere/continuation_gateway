@@ -19,7 +19,9 @@ ENV PIP_INDEX_URL=${PIP_INDEX_URL}
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# --progress-bar off：pip 默认的进度条会起一个后台刷新线程，在 seccomp 策略较旧、拦截 clone3 的
+# 构建环境里（基础镜像 glibc >= 2.34 时建线程走 clone3）会报 can't start new thread。
+RUN pip install --no-cache-dir --progress-bar off -r requirements.txt
 
 COPY . .
 
