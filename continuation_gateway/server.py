@@ -210,11 +210,8 @@ async def passthrough(request: web.Request, raw_body: bytes = None) -> web.Strea
                                           allow_redirects=False)
     except (ClientError, asyncio.TimeoutError) as e:
         log.warning("PASSTHROUGH %s %s failed: %s", request.method, request.path_qs, e)
-        # 429 而不是 502：理由跟 guarded() 里 leg1_connect_error 那处一样（见那边的完整
-        # 注释）——前面的 nginx 只在 5xx 上做绕开两层网关直连 SGLang 的重试，429 能避开
-        # 这条规则，把"这个集群现在连不上下游"如实反映给最上层调用方去做 Provider 级别的
-        # 失败转移，而不是在已经吃紧的下游上再空转两轮重试。
-        return web.Response(status=429, text=f"downstream error: {e}\n")
+        # 连不上下游 / 超时：网关作为代理返回 502，语义与 guarded() 里 leg1_connect_error 一致。
+        return web.Response(status=502, text=f"downstream error: {e}\n")
     del data
     return await _stream_downstream_verbatim(request, downstream)
 
@@ -502,18 +499,10 @@ async def guarded(request: web.Request, payload: dict, raw_body: bytes) -> web.S
         raise
     except (ClientError, asyncio.TimeoutError) as e:
         log.warning("[continuation req=%s] FAILED reason=leg1_connect_error: %s", req_id, e)
-        # 这里连不上下游，返回 429 而不是 502
-        # 部署环境里这个网关前面还有一层 nginx，规则是"收到 5xx 就重试，最多两次，重试目标
-        # 直接打 SGLang pod、绕开这里和另一层网关"——用 502/503/504 这类 5xx 等于在下游已经
-        # 扛不住新连接（这条异常本身就是这个信号）的时候，教 nginx 绕开两层网关的保护（也
-        # 包括这里的续写覆盖）再多打两发直连请求，雪上加霜；两次重试大概率还是失败，兜一圈
-        # 只是白白多占用下游的连接资源、多等一轮 CONNECT_TIMEOUT_SECONDS。429 是 4xx，nginx
-        # 这条重试规则不会命中，失败会直接原样传回最上层调用方——业务侧确认过收到 429 会
-        # 切到备用 API Provider，这正是"这个集群现在真扛不住，找别家"该有的信号，比在自己
-        # 集群内部空转重试更合适。`leg1_http_<code>`（下游明确返回的非 200 状态码）不受
-        # 这条影响，那条路径走的是 `_stream_downstream_verbatim()` 原样透传下游真实状态码，
-        # 不是这里讨论的"网关自己决定发什么"。
-        return web.Response(status=429, text=f"downstream error: {e}\n")
+        # 连不上下游 / 建连超时：网关作为代理返回 502。
+        # `leg1_http_<code>`（下游明确返回的非 200 状态码）不受影响，那条路径走
+        # `_stream_downstream_verbatim()` 原样透传下游真实状态码。
+        return web.Response(status=502, text=f"downstream error: {e}\n")
     # 原始字节只在上面这次 POST 里用一次——续写腿是从解析好的 payload dict 重建的，不需要
     # raw_body。并发多、body 又可能带 base64 图片这种大 payload 时，不早点扔掉这份引用的话，
     # 它会跟着这个协程一直活到整条流结束（可能是几十秒后），白占内存。
