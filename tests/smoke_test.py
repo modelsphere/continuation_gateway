@@ -1,7 +1,7 @@
 """本地冒烟测试：不连真实下游集群，起两个假 downstream（一个模拟 DOWNSTREAM_URL，一个模拟
 CONTINUATION_URL）+ 真的 continuation_gateway 服务，用 aiohttp client 打真实 HTTP 请求，
 验证网关机制本身对不对：卡住/断连能不能触发续写、tool_call 出现后是不是老实不救、第一个
-chunk 都没等到时是不是彻底不介入（不重试、异常直接往上传）、usage 改写对不对、按 model
+chunk 都没等到时是不是彻底不介入（不重试、异常直接往上传）、usage 改写对不对、按 CONTINUATION_MODEL
 分派的前缀重建（XTML vs 通用 <think> 标签）对不对、续写请求是不是真的按 CONTINUATION_URL
 路由、CONTINUATION_ENABLED=False 时是不是只监测不真的发第二条腿。
 不验证"续写内容语义连不连贯"——那部分要在真实集群上验证，这里只测网关自己写的转发/编排代码。
@@ -22,7 +22,8 @@ import sys
 import time
 
 os.environ["DOWNSTREAM_URL"] = "http://127.0.0.1:18081"
-os.environ["CONTINUATION_MODELS"] = "test-model,kimi-k3"
+# 通用 <think> builder；kimi_k3_xtml_stall 场景会临时切到 kimi-k3 验证 XTML 分派。
+os.environ["CONTINUATION_MODEL"] = "test-model"
 os.environ["STALL_IDLE_TIMEOUT_SECONDS"] = "0.6"
 os.environ["CONNECT_TIMEOUT_SECONDS"] = "5"
 os.environ["MAX_CONTINUATION_BODY_MB"] = "1"
@@ -83,8 +84,8 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
             await asyncio.sleep(5)  # 永远等不到下一个 chunk，触发 idle timeout
         else:
             assert body.get("continue_final_message") is True
-            # model="test-model" 走的是通用 <think>...</think> builder（非 kimi-k3 的默认
-            # 分支，见 reconstruct.py _BUILDERS），XTML 分派单独在 kimi_k3_xtml_stall 场景测。
+            # CONTINUATION_MODEL="test-model" 走的是通用 <think>...</think> builder（非 kimi-k3 的
+            # 默认分支，见 reconstruct.py _BUILDERS），XTML 分派单独在 kimi_k3_xtml_stall 场景测。
             assert "</think>The answer is par" in body["messages"][-1]["content"]
             expected_budget = 1000 - (est("let me think. ") + est("The answer is par"))
             assert body.get("max_tokens") == expected_budget, \
@@ -109,7 +110,7 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
             raise ConnectionResetError("simulated crash mid-stream")
         else:
             assert body.get("continue_final_message") is True
-            # model="test-model" 走通用 <think> builder，content 为空所以不闭合标签
+            # CONTINUATION_MODEL="test-model" 走通用 <think> builder，content 为空所以不闭合标签
             # （见 reconstruct.py _build_prefix_think_tag 的说明）。
             assert body["messages"][-1]["content"] == "<think>step one. step two"
             assert body.get("chat_template_kwargs") is None  # thinking 不该被关
@@ -122,9 +123,9 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
             await resp.write(b"data: [DONE]\n\n")
 
     elif scenario == "kimi_k3_xtml_stall":
-        # 专门验证 reconstruct.py 的按 model 分派：model="kimi-k3" 应该走 XTML builder
-        # （<|open|>think<|sep|>...<|close|>think<|sep|><|open|>response<|sep|>...），
-        # 跟 test-model 走的通用 <think> 格式不是同一套。
+        # 专门验证 reconstruct.py 的按 CONTINUATION_MODEL 分派：CONTINUATION_MODEL="kimi-k3"
+        # 应该走 XTML builder（<|open|>think<|sep|>...<|close|>think<|sep|><|open|>response<|sep|>...），
+        # 跟 test-model 走的通用 <think> 格式不是同一套；请求里的 model 只是对外服务名，不参与分派。
         if call_n == 1:
             await resp.write(sse({"choices": [{"delta": {"reasoning_content": "k3 thinking. "}}]}))
             await resp.write(sse({"choices": [{"delta": {"content": "k3 answer"}}]}))
@@ -275,8 +276,8 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
         return web.Response(status=200, text="should never get here")
 
     elif scenario == "passthrough_check":
-        # 纯透传场景：不管调几次都立刻正常返回，不卡、不断连，用来验证非 continuation
-        # model 走的是纯转发，网关完全没有介入（没有 idle timeout 包装、没有 SSE 解析）。
+        # 纯透传场景：不管调几次都立刻正常返回，不卡、不断连，用来验证未配置
+        # CONTINUATION_MODEL 时走的是纯转发，网关完全没有介入（没有 idle timeout 包装、没有 SSE 解析）。
         await resp.write(sse({"choices": [{"delta": {"content": "untouched passthrough."}}]}))
         await resp.write(sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
         await resp.write(b"data: [DONE]\n\n")
@@ -471,7 +472,12 @@ async def run_gateway():
     return runner
 
 
-async def call_gateway(scenario: str, model: str = "test-model", extra: dict = None, drop: list = None):
+# 请求里的 model 故意跟 CONTINUATION_MODEL 不一致（对应引擎 --served-model-name 随意指定的
+# 情况），续写方案不应该受它影响。
+SERVED_MODEL_NAME = "served-alias"
+
+
+async def call_gateway(scenario: str, model: str = SERVED_MODEL_NAME, extra: dict = None, drop: list = None):
     payload = {"model": model, "stream": True, "max_tokens": 1000, "temperature": 0.7,
                "messages": [{"role": "user", "content": "hi"}]}
     for key in drop or []:
@@ -572,8 +578,13 @@ async def main():
         check("usage reasoning_tokens = leg2(3) + recovered reasoning",
               r["usage"]["reasoning_tokens"] == 3 + recovered_reasoning, r["usage"])
 
-        print("\n== kimi_k3_xtml_stall (model=kimi-k3 走 XTML builder, 跟通用 <think> 格式不同) ==")
-        r = await call_gateway("kimi_k3_xtml_stall", model="kimi-k3")
+        print("\n== kimi_k3_xtml_stall (CONTINUATION_MODEL=kimi-k3 走 XTML builder, 跟通用 <think> 格式不同) ==")
+        original_continuation_model = gw_config.CONTINUATION_MODEL
+        gw_config.CONTINUATION_MODEL = "kimi-k3"
+        try:
+            r = await call_gateway("kimi_k3_xtml_stall")
+        finally:
+            gw_config.CONTINUATION_MODEL = original_continuation_model
         print("  ", r)
         check("content merged correctly", r["content"] == "k3 answer continued.", r["content"])
         check("finish_reason present", r["finish_reason"] == "stop")
@@ -851,8 +862,13 @@ async def main():
         finally:
             gw_config.BUFFER_TOOL_CALLS = False
 
-        print("\n== 非 continuation model：纯透传，不触发任何续写逻辑 ==")
-        r = await call_gateway("passthrough_check", model="some-other-model")
+        print("\n== 未配置 CONTINUATION_MODEL：纯透传，不触发任何续写逻辑 ==")
+        original_continuation_model = gw_config.CONTINUATION_MODEL
+        gw_config.CONTINUATION_MODEL = ""
+        try:
+            r = await call_gateway("passthrough_check")
+        finally:
+            gw_config.CONTINUATION_MODEL = original_continuation_model
         print("  ", r)
         check("passthrough got downstream content verbatim", r["content"] == "untouched passthrough.", r["content"])
         check("only 1 downstream call (no retry machinery engaged)",

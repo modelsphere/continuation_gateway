@@ -29,8 +29,9 @@ EXPOSE 8000
 
 # 必需的运行时环境变量（构建时不需要，容器启动时必须提供，否则 server.py 会直接退出）：
 #   DOWNSTREAM_URL       下游路由网关地址，例如 http://router.example.com:8050
-#   CONTINUATION_MODELS  逗号分隔的 model 名字，只有列出的 model 才会触发续写，
-#                        不设置就默认空集合、什么都不触发
+#   CONTINUATION_MODEL   本部署实际 serve 的真实模型（不是 --served-model-name 对外暴露的
+#                        名字），决定续写的前缀构造方案，对所有请求生效；不设置就什么都
+#                        不触发、所有请求原样透传
 # 可选（默认值见 continuation_gateway/config.py）：
 #   PORT（默认 8000）、CONTINUATION_URL（续写请求单独打去另一个地址，不设置就跟
 #   DOWNSTREAM_URL 一样）、CONTINUATION_ENABLED（默认 true；设成 false 只监测 leg1、

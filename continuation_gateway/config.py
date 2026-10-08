@@ -9,12 +9,13 @@ PORT = int(os.environ.get("PORT", "8000"))
 # 只有真的判定要救、发出去的那条续写请求走这个。
 CONTINUATION_URL = (os.environ.get("CONTINUATION_URL", "").rstrip("/") or DOWNSTREAM_URL)
 
-# 前缀重建按 model 分派（见 reconstruct.py），只对这里列出的 model 名字触发续写，其余 model
-# 原样透传。不设置时默认空集合——即什么都不触发，逼着部署时显式声明。大小写不敏感（存小写，
-# 匹配时也把请求里的 model 转小写），避免客户端传的大小写跟这里配置的不一致导致漏判。
-CONTINUATION_MODELS = {
-    m.strip().lower() for m in os.environ.get("CONTINUATION_MODELS", "").split(",") if m.strip()
-}
+# 本部署实际 serve 的真实模型（不是对外暴露的名字）。一个部署（一个 namespace）只对应一种
+# 模型、一种引擎，续写的前缀构造方案（见 reconstruct.py）完全由这个值决定，对该部署收到的所有
+# 请求一视同仁，不再看请求体里的 model 字段——推理引擎的 --served-model-name 可以任意指定，
+# 跟真实模型不一定相符，请求里的 model 只是对外的服务名，不能用来判断该用哪套前缀格式。
+# 大小写不敏感（存小写）。不设置时默认空——什么都不触发、所有请求原样透传，逼着部署时显式
+# 声明，避免没配置时静默套用一个可能不匹配的前缀格式。
+CONTINUATION_MODEL = os.environ.get("CONTINUATION_MODEL", "").strip().lower()
 
 # 关掉之后网关仍然完整做 leg1 的监测（idle timeout/断连检测、TRIGGERED 判定和留痕都不受
 # 影响），只是不真的发第二条腿——用来在不给下游集群增加真实续写请求负载的前提下，验证"这条

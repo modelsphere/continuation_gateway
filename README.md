@@ -22,8 +22,9 @@ already sent to the client is assembled into an assistant prefix, and the model 
 carry on from there. To the client, it is still a single, continuous, complete streaming
 response.
 
-The way the prefix is assembled is dispatched by model (see
-`continuation_gateway/reconstruct.py`). Two formats are built in: Kimi-K3 (XTML) and a generic
+The way the prefix is assembled is determined by `CONTINUATION_MODEL` (the model this
+deployment actually serves; the `model` field of the request is not consulted), see
+`continuation_gateway/reconstruct.py`. Two formats are built in: Kimi-K3 (XTML) and a generic
 `<think>...</think>` format. Supporting a model with another format only takes adding a
 builder there.
 
@@ -117,7 +118,7 @@ Run the container (environment variables are described in the next section):
 ```bash
 docker run --rm -p 8000:8000 \
     -e DOWNSTREAM_URL=http://<router>:<port> \
-    -e CONTINUATION_MODELS=<model name> \
+    -e CONTINUATION_MODEL=<actual model> \
     continuation-gateway:latest
 ```
 
@@ -129,9 +130,17 @@ The downstream is expected to be a datacenter/cluster router (not a specific SGL
 directly). The original request and the continuation request go to the same URL by default:
 
 ```bash
-DOWNSTREAM_URL=http://<router>:<port> CONTINUATION_MODELS=<model name> \
+DOWNSTREAM_URL=http://<router>:<port> CONTINUATION_MODEL=<actual model> \
     python -m continuation_gateway.server
 ```
+
+`CONTINUATION_MODEL` is the model the downstream of this deployment actually serves (for
+example `kimi-k3`, case-insensitive). It is **not** the `model` field of the client's request,
+nor the inference engine's `--served-model-name` (which can be set to anything and need not
+match the real model). The gateway assumes a deployment's downstream serves a single model;
+this value decides how the continuation prefix is built and applies uniformly to every request
+it receives — requests are no longer filtered by their `model` field. When it is not set, the
+gateway triggers no continuation at all and passes every request through unchanged.
 
 Optional environment variables (defaults are in `continuation_gateway/config.py`): `PORT`,
 `CONTINUATION_URL` (send the continuation request to a different address; if unset it is the
@@ -165,7 +174,7 @@ request as a plain pass-through, the same as when `BUFFER_TOOL_CALLS` is not ena
 uses real HTTP requests to verify the gateway's own forwarding and orchestration logic
 (continuation triggered by stall/disconnect, scenarios such as tool_call / response_format /
 oversized body being left alone, usage rewriting, and prefix reconstruction dispatched by
-model). It does not verify whether the continued content is semantically coherent — that has
+`CONTINUATION_MODEL`). It does not verify whether the continued content is semantically coherent — that has
 to be verified on a real cluster.
 
 ```bash

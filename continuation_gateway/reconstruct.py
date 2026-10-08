@@ -1,7 +1,8 @@
 """崩溃前那条腿的 assistant partial 前缀构造。不同模型家族拼 partial assistant 消息用的
 控制 token 不一样（Kimi-K3 是自成一套的 XTML 方案，Kimi-K2 系走的是经典 <think>...</think>
-sentinel token 方案），按 model 分派到各自的构造函数，见 _BUILDERS——没有专门适配过的 model
-落到 _build_prefix_think_tag（<think>...</think> 格式）：这是目前已知模型里除 Kimi-K3 外
+sentinel token 方案），按部署所服务的真实模型（config.CONTINUATION_MODEL，不是请求里的
+model 字段）分派到各自的构造函数，见 _BUILDERS——没有专门适配过的模型落到
+_build_prefix_think_tag（<think>...</think> 格式）：这是目前已知模型里除 Kimi-K3 外
 的通用写法，但不保证覆盖所有未来接入的模型，真遇到别的格式要在这里加一个专门的 builder，
 不要指望默认格式蒙对。
 

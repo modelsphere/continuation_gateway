@@ -16,8 +16,9 @@ LLM 推理服务的崩溃续写网关：位于客户端和 OpenAI 兼容的推�
 发起**一次**续写请求：把已经吐给客户端的 reasoning/content 拼成 assistant prefix，让模型
 接着往下生成，客户端看到的仍然是一条连续、完整的流式响应。
 
-前缀拼接方式按 model 分派（见 `continuation_gateway/reconstruct.py`），内置 Kimi-K3（XTML）
-和通用 `<think>...</think>` 两种格式，接入其它格式的模型只需要在那里加一个 builder。
+前缀拼接方式由 `CONTINUATION_MODEL`（本部署实际 serve 的真实模型，不看请求里的 `model`
+字段）决定（见 `continuation_gateway/reconstruct.py`），内置 Kimi-K3（XTML）和通用
+`<think>...</think>` 两种格式，接入其它格式的模型只需要在那里加一个 builder。
 
 ```
                                   leg1：原始请求
@@ -90,7 +91,7 @@ docker build -t continuation-gateway:latest \
 ```bash
 docker run --rm -p 8000:8000 \
     -e DOWNSTREAM_URL=http://<路由网关>:<port> \
-    -e CONTINUATION_MODELS=<model 名字> \
+    -e CONTINUATION_MODEL=<真实模型名> \
     continuation-gateway:latest
 ```
 
@@ -102,9 +103,15 @@ docker run --rm -p 8000:8000 \
 同一个 URL：
 
 ```bash
-DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODELS=<model 名字> \
+DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODEL=<真实模型名> \
     python -m continuation_gateway.server
 ```
+
+`CONTINUATION_MODEL` 是本部署下游实际 serve 的真实模型（例如 `kimi-k3`，大小写不敏感），**不是**
+客户端请求里的 `model` 字段，也不是推理引擎的 `--served-model-name`（后者可以任意指定，跟真实
+模型不一定相符）。网关假定一个部署下游只有一种模型，这个值决定续写请求的前缀怎么拼，并对
+收到的所有请求一视同仁生效，不再按请求里的 `model` 过滤。不设置时网关不触发任何续写，所有请求
+原样透传。
 
 可选环境变量（默认值见 `continuation_gateway/config.py`）：`PORT`、`CONTINUATION_URL`
 （续写请求单独打去另一个地址，不设置就跟 `DOWNSTREAM_URL` 一样）、`CONTINUATION_ENABLED`
@@ -129,8 +136,8 @@ tool_call 参数不再逐 chunk 流式到达，而是在 tool_call 完成后一�
 
 `tests/smoke_test.py`：不连真实集群，起一个本地假 downstream（模拟 SGLang 的流式响应）+
 真的 `continuation_gateway` 服务，用真实 HTTP 请求验证网关自己的转发/编排逻辑（卡住/断连
-触发续写、tool_call/response_format/超限 body 等场景老实不救、usage 改写、按 model 分派的
-前缀重建）。不验证续写内容语义是否连贯——那部分要在真实集群上验证。
+触发续写、tool_call/response_format/超限 body 等场景老实不救、usage 改写、按 `CONTINUATION_MODEL`
+分派的前缀重建）。不验证续写内容语义是否连贯——那部分要在真实集群上验证。
 
 ```bash
 python tests/smoke_test.py

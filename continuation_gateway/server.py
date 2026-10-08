@@ -26,7 +26,7 @@ usage.py `correct_usage()` 顶部注释。这条判断跟大 body 排除（MAX_C
 跑法（下游预期是一个机房/集群路由网关，不是直连某个具体 SGLang 实例；实例选择/避开故障实例
 交给下游网关负责，这一层不自己维护 SGLang 实例列表）：
 
-    DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODELS=<model 名字> \\
+    DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODEL=<真实模型名> \\
         python -m continuation_gateway.server
 
 原始请求和续写请求默认打同一个 URL，可以用 CONTINUATION_URL 单独把续写请求（leg2）导到另一
@@ -115,7 +115,6 @@ def should_intervene(payload: dict, body_size: int) -> bool:
     # 覆盖，后续日志走"[continuation req=...]"那一套）还是 passthrough()（纯转发，
     # 只有 passthrough() 自己那一行日志），任何一个分支悄悄漏判都会导致事后查不到"这条
     # 请求当时为什么没进续写覆盖"。
-    model = (payload.get("model") or "").lower()
     if not payload.get("stream"):
         log.info("model=%s non-stream request, skipping continuation coverage (passthrough only)",
                   payload.get("model"))
@@ -128,9 +127,9 @@ def should_intervene(payload: dict, body_size: int) -> bool:
         log.info("model=%s client already sent continue_final_message, skipping continuation "
                   "coverage (passthrough only)", payload.get("model"))
         return False
-    if not config.CONTINUATION_MODELS or model not in config.CONTINUATION_MODELS:
-        log.info("model=%s not in CONTINUATION_MODELS=%s, skipping continuation coverage "
-                  "(passthrough only)", payload.get("model"), config.CONTINUATION_MODELS or "<none configured>")
+    if not config.CONTINUATION_MODEL:
+        log.info("model=%s CONTINUATION_MODEL not configured, skipping continuation coverage "
+                  "(passthrough only)", payload.get("model"))
         return False
     if (payload.get("response_format") or {}).get("type") in ("json_object", "json_schema"):
         # 结构化输出（json_object/json_schema）不进续写，且不打算靠改 SGLang 支持——这条跟
@@ -398,7 +397,7 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
     # （不常见），两个都按扣减后的值改，避免下游到底读哪个字段产生歧义。
     budget_fields = [f for f in ("max_tokens", "max_completion_tokens") if original_payload.get(f) is not None]
 
-    prefix = build_prefix(original_payload.get("model"), state.reasoning, state.content)
+    prefix = build_prefix(config.CONTINUATION_MODEL, state.reasoning, state.content)
     continuation_payload = dict(original_payload)
     continuation_payload["messages"] = list(original_payload.get("messages", [])) + [
         {"role": "assistant", "content": prefix}
@@ -766,9 +765,9 @@ def main():
     app.router.add_get("/health", health)
     app.router.add_route("*", "/{tail:.*}", catch_all)
     log.info("listening on 0.0.0.0:%d, forwarding to %s, continuation requests to %s "
-              "(continuation models: %s, continuation enabled: %s)",
+              "(continuation model: %s, continuation enabled: %s)",
               config.PORT, config.DOWNSTREAM_URL, config.CONTINUATION_URL,
-              config.CONTINUATION_MODELS or "<none configured>", config.CONTINUATION_ENABLED)
+              config.CONTINUATION_MODEL or "<none configured>", config.CONTINUATION_ENABLED)
     # handler_cancellation=True：aiohttp 的默认值是 False，默认值下客户端断连时
     # RequestHandler.connection_lost() 不会 cancel 正在处理这个请求的 task（读
     # aiohttp/web_protocol.py 源码确认，`_task_handler.cancel()` 那行套在
