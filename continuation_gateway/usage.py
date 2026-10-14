@@ -85,7 +85,8 @@ def estimate_recovered_tokens(original_payload: dict, reasoning_text: str, conte
     return RecoveredTokens(prompt_tokens, reasoning_tokens, content_tokens)
 
 
-def correct_usage(recovered: RecoveredTokens, final_leg_usage: dict, is_multimodal: bool = False) -> dict:
+def correct_usage(recovered: RecoveredTokens, final_leg_usage: dict, is_multimodal: bool = False,
+                   engine: str = "sglang") -> dict:
     """completion/reasoning_tokens 只做加法，不从 prompt_tokens 里减——从 prompt_tokens 里减
     需要知道"崩溃前那条腿的 prompt 具体长什么样"才能算出重叠部分，风险和实现复杂度都更高，
     加法路线牺牲一点精确度换取更简单、更不容易出错的实现。cached_tokens 要 clamp 成严格小于
@@ -103,7 +104,6 @@ def correct_usage(recovered: RecoveredTokens, final_leg_usage: dict, is_multimod
     token 数的还原，不再依赖对图片这类内容做字符数估算。非多模态请求维持原来的估算值，不受
     这条分支影响。"""
     completion_tokens = final_leg_usage.get("completion_tokens", 0) + recovered.total_recovered
-    reasoning_tokens = final_leg_usage.get("reasoning_tokens", 0) + recovered.reasoning_tokens
     if is_multimodal:
         prompt_tokens = max(0, final_leg_usage.get("prompt_tokens", 0) - recovered.total_recovered)
     else:
@@ -114,8 +114,18 @@ def correct_usage(recovered: RecoveredTokens, final_leg_usage: dict, is_multimod
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
-        "reasoning_tokens": reasoning_tokens,
     }
+    # reasoning_tokens 的算法两个引擎相同（leg2 上报值 + 被救回的 reasoning 估算；leg2 没上报
+    # 就按 0 算），只是位置不同：SGLang 在 usage 顶层，vLLM 在 completion_tokens_details 里。
+    # 不能按 leg2 的形状判断位置：vLLM 没启用 reasoning parser 时整个字段缺失，缺失时也要
+    # 构造在 vLLM 约定的位置上。
+    if engine == "vllm":
+        completion_details = dict(final_leg_usage.get("completion_tokens_details") or {})
+        completion_details["reasoning_tokens"] = (
+            completion_details.get("reasoning_tokens", 0) + recovered.reasoning_tokens)
+        corrected["completion_tokens_details"] = completion_details
+    else:
+        corrected["reasoning_tokens"] = final_leg_usage.get("reasoning_tokens", 0) + recovered.reasoning_tokens
     details = final_leg_usage.get("prompt_tokens_details")
     if details:
         details = dict(details)
@@ -126,7 +136,8 @@ def correct_usage(recovered: RecoveredTokens, final_leg_usage: dict, is_multimod
 
 
 def rewrite_leg2_line(line: bytes, recovered: RecoveredTokens, response_id: Optional[str],
-                       is_multimodal: bool = False, reasoning_field: Optional[str] = None) -> bytes:
+                       is_multimodal: bool = False, reasoning_field: Optional[str] = None,
+                       engine: str = "sglang") -> bytes:
     """续写腿逐行转发时用：两件事都在这一行原地做——①带 usage 的那条 data 行替换成修正后
     的值；②把 id 改写回 leg1 的原始 response_id。续写腿是网关自己发起的第二个下游请求，
     下游会给它分配一个全新的 completion id，如果不改写，客户端会在同一个响应流里看到 id
@@ -134,7 +145,8 @@ def rewrite_leg2_line(line: bytes, recovered: RecoveredTokens, response_id: Opti
     被当成异常，也会让"客户端和网关日志对上是哪个请求"这件事失去一个本该天然存在的锚点）。
     response_id 为 None（理论上不该发生，leg1 至少一个 chunk 才会走到续写）时不改写 id，
     只做 usage 修正，其余字段原样透传。is_multimodal 原样透传给 correct_usage()，决定
-    prompt_tokens 走估算值还是从真实 leg2 prompt_tokens 减算，见该函数顶部注释。
+    prompt_tokens 走估算值还是从真实 leg2 prompt_tokens 减算，见该函数顶部注释；engine 同样
+    透传，决定 reasoning_tokens 写在 usage 的哪个位置。
 
     reasoning_field 是 leg1 里思考内容用的字段名（见 sse.StreamState.reasoning_field）：
     续写腿可能被路由到另一种推理后端（SGLang 叫 reasoning_content，vLLM 叫 reasoning），
@@ -166,7 +178,7 @@ def rewrite_leg2_line(line: bytes, recovered: RecoveredTokens, response_id: Opti
                     delta[reasoning_field] = value
                 changed = True
     if obj.get("usage"):
-        obj["usage"] = correct_usage(recovered, obj["usage"], is_multimodal)
+        obj["usage"] = correct_usage(recovered, obj["usage"], is_multimodal, engine)
         changed = True
     if not changed:
         return line

@@ -17,6 +17,12 @@ CONTINUATION_URL = (os.environ.get("CONTINUATION_URL", "").rstrip("/") or DOWNST
 # 声明，避免没配置时静默套用一个可能不匹配的前缀格式。
 CONTINUATION_MODEL = os.environ.get("CONTINUATION_MODEL", "").strip().lower()
 
+# 本部署下游的推理引擎：sglang（默认）或 vllm，大小写不敏感。两个引擎的续写请求形态相同
+# （都是 /v1/chat/completions + continue_final_message），差别有两处：vllm 下带多模态内容
+# （图片/音频/视频）的请求不进续写、原样透传；usage 里 reasoning_tokens 的位置不同——
+# SGLang 在顶层，vLLM 在 completion_tokens_details 里（见 usage.py）。
+CONTINUATION_ENGINE = os.environ.get("CONTINUATION_ENGINE", "sglang").strip().lower()
+
 # 关掉之后网关仍然完整做 leg1 的监测（idle timeout/断连检测、TRIGGERED 判定和留痕都不受
 # 影响），只是不真的发第二条腿——用来在不给下游集群增加真实续写请求负载的前提下，验证"这条
 # 监测链路本身有没有打通"（能不能正确识别出该救的场景、日志/告警链路走不走得通）。默认打开，

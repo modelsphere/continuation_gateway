@@ -3,14 +3,32 @@
 English | [简体中文](README.zh-CN.md)
 
 > [!IMPORTANT]
-> **Only SGLang is supported as the inference engine at present.** vLLM is not supported
-> yet: the continuation request relies on the `continue_final_message` /
-> `add_generation_prompt=false` semantics, which SGLang implements uniformly, while vLLM
-> leaves them to each model's chat template / tokenizer, so many models ignore them or
-> cannot continue from a partial reply.
+> The gateway supports **SGLang** and **vLLM** as the inference engine, selected with
+> `CONTINUATION_ENGINE`. Within this project, each engine + model combination has its own
+> continuation strategy. The combinations verified so far:
+>
+> **SGLang**
+>
+> | Model | Status | Notes |
+> | --- | --- | --- |
+> | Kimi-K3 | ✅ Verified | |
+> | Qwen3.6-35B-A3B | ✅ Verified | |
+> | GLM-5.3 | ✅ Verified | |
+>
+> **vLLM**
+>
+> | Model | Status | Notes |
+> | --- | --- | --- |
+> | Qwen3.6-35B-A3B | ✅ Verified | |
+> | GLM-5.3 | ✅ Verified | |
+> | Kimi-K3 | ❌ Not supported | |
+>
+> Other models and engines have not been verified; they may work, but please verify them
+> yourself before relying on them. We are continuing to adapt more engine + model
+> combinations.
 
 A crash-continuation gateway for LLM inference services. It sits between clients and an
-OpenAI-compatible inference service (currently SGLang only — see the note above).
+OpenAI-compatible inference service (SGLang or vLLM — see the note above).
 
 An inference instance can crash in the middle of a streaming generation, have its connection
 reset, or stall (the process is alive but stops emitting tokens). The client is then left with
@@ -31,7 +49,7 @@ builder there.
 ```
                                leg1: original request
   client ──▶ continuation_gateway ──────────────────▶ downstream router ──▶ inference instance
-     ▲         │  forwards chunk by chunk, parses SSE   (SGLang)
+     ▲         │  forwards chunk by chunk, parses SSE   (SGLang / vLLM)
      │         │  accumulates reasoning / content
      │         │  detects stall / disconnect (no finish_reason seen)
      │         ▼
@@ -92,6 +110,8 @@ on `should_intervene()` in `continuation_gateway/server.py` for details:
   signal to recognize it.
 - Requests that already carry `continue_final_message` from the client: continuation is not
   stacked on top.
+- With `CONTINUATION_ENGINE=vllm`, requests whose messages carry non-text content (images,
+  audio, video).
 - Request bodies larger than `MAX_CONTINUATION_BODY_MB` (by default, large multimodal bodies).
 
 ## Building the image
@@ -119,6 +139,7 @@ Run the container (environment variables are described in the next section):
 docker run --rm -p 8000:8000 \
     -e DOWNSTREAM_URL=http://<router>:<port> \
     -e CONTINUATION_MODEL=<actual model> \
+    -e CONTINUATION_ENGINE=<sglang|vllm> \
     continuation-gateway:latest
 ```
 
@@ -131,7 +152,7 @@ directly). The original request and the continuation request go to the same URL 
 
 ```bash
 DOWNSTREAM_URL=http://<router>:<port> CONTINUATION_MODEL=<actual model> \
-    python -m continuation_gateway.server
+    CONTINUATION_ENGINE=<sglang|vllm> python -m continuation_gateway.server
 ```
 
 `CONTINUATION_MODEL` is the model the downstream of this deployment actually serves (for
@@ -141,6 +162,10 @@ match the real model). The gateway assumes a deployment's downstream serves a si
 this value decides how the continuation prefix is built and applies uniformly to every request
 it receives — requests are no longer filtered by their `model` field. When it is not set, the
 gateway triggers no continuation at all and passes every request through unchanged.
+
+`CONTINUATION_ENGINE` is the inference engine behind the downstream, `sglang` (default) or
+`vllm`. See the compatibility table at the top for which engine + model combinations are
+verified.
 
 Optional environment variables (defaults are in `continuation_gateway/config.py`): `PORT`,
 `CONTINUATION_URL` (send the continuation request to a different address; if unset it is the

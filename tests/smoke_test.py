@@ -3,7 +3,9 @@ CONTINUATION_URL）+ 真的 continuation_gateway 服务，用 aiohttp client 打
 验证网关机制本身对不对：卡住/断连能不能触发续写、tool_call 出现后是不是老实不救、第一个
 chunk 都没等到时是不是彻底不介入（不重试、异常直接往上传）、usage 改写对不对、按 CONTINUATION_MODEL
 分派的前缀重建（XTML vs 通用 <think> 标签）对不对、续写请求是不是真的按 CONTINUATION_URL
-路由、CONTINUATION_ENABLED=False 时是不是只监测不真的发第二条腿。
+路由、CONTINUATION_ENABLED=False 时是不是只监测不真的发第二条腿、CONTINUATION_ENGINE=vllm
+时多模态请求是不是透传、CONTINUATION_ENGINE=vllm 时 usage 的 reasoning_tokens 是不是写在
+completion_tokens_details 里（包括 leg2 没上报的情况）。
 不验证"续写内容语义连不连贯"——那部分要在真实集群上验证，这里只测网关自己写的转发/编排代码。
 
 usage/max_tokens 扣减用到的 token 数不是靠 /v1/tokenize 现测的（这条集成已经被去掉了），是
@@ -236,6 +238,34 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
             await resp.write(sse({"choices": [], "usage": {
                 "prompt_tokens": 500, "completion_tokens": 5, "total_tokens": 505, "reasoning_tokens": 3}}))
             await resp.write(b"data: [DONE]\n\n")
+
+    elif scenario in ("vllm_usage_shape", "vllm_usage_no_reasoning_details"):
+        # vLLM 形状的响应：思考字段叫 reasoning；usage 里没有顶层 reasoning_tokens，
+        # reasoning_tokens 放在 completion_tokens_details 里，prompt_tokens_details 没有
+        # 缓存信息时整个字段缺失（而不是 null）。vllm_usage_no_reasoning_details 模拟 vLLM
+        # 没启用 reasoning parser：completion_tokens_details 整个缺失。
+        if call_n == 1:
+            await resp.write(sse({"id": "chatcmpl-leg1", "choices": [{"delta": {"reasoning": "step one. "}}]}))
+            await resp.write(sse({"id": "chatcmpl-leg1", "choices": [{"delta": {"reasoning": "step two"}}]}))
+            await resp.write_eof()
+            resp.force_close()
+            raise ConnectionResetError("simulated crash mid-stream")
+        else:
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [{"delta": {"reasoning": " step three."}}]}))
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [{"delta": {"content": "done."}}]}))
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [{"delta": {}, "finish_reason": "stop"}]}))
+            usage = {"prompt_tokens": 500, "completion_tokens": 5, "total_tokens": 505}
+            if scenario == "vllm_usage_shape":
+                usage["completion_tokens_details"] = {"reasoning_tokens": 3}
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [], "usage": usage}))
+            await resp.write(b"data: [DONE]\n\n")
+
+    elif scenario == "vllm_multimodal_passthrough":
+        # engine=vllm 时多模态请求不进续写：下游卡住也不该被网关掐断去续写。
+        await resp.write(sse({"choices": [{"delta": {"content": "image reply, untouched."}}]}))
+        await asyncio.sleep(1.0)  # 比 idle timeout(0.6s) 长，进了续写覆盖就会在这里被掐断
+        await resp.write(sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+        await resp.write(b"data: [DONE]\n\n")
 
     elif scenario == "role_only_disconnect":
         # 只吐一个空白的角色声明 chunk（没有 reasoning、没有 content、没有 tool_calls），
@@ -602,6 +632,51 @@ async def main():
         check("no reasoning/content recovered", r["reasoning"] == "" and r["content"] == "")
         check("only 1 downstream call made (SKIPPED reason=no_recoverable_content，不发第二条腿)",
               call_counts.get("role_only_disconnect") == 1)
+
+        print("\n== vllm_usage_shape (CONTINUATION_ENGINE=vllm：reasoning_tokens 在 completion_tokens_details 里) ==")
+        original_engine = gw_config.CONTINUATION_ENGINE
+        gw_config.CONTINUATION_ENGINE = "vllm"
+        try:
+            r = await call_gateway("vllm_usage_shape")
+            r_no_details = await call_gateway("vllm_usage_no_reasoning_details")
+        finally:
+            gw_config.CONTINUATION_ENGINE = original_engine
+        print("  ", r)
+        check("reasoning merged correctly (field name `reasoning`)",
+              r["reasoning"] == "step one. step two step three.", r["reasoning"])
+        check("client keeps seeing `reasoning`", r["reasoning_fields"] == {"reasoning"}, r["reasoning_fields"])
+        recovered_reasoning = est("step one. step two")
+        check("usage completion_tokens = leg2(5) + recovered reasoning",
+              r["usage"]["completion_tokens"] == 5 + recovered_reasoning, r["usage"])
+        check("completion_tokens_details.reasoning_tokens = leg2(3) + recovered reasoning",
+              r["usage"]["completion_tokens_details"] == {"reasoning_tokens": 3 + recovered_reasoning}, r["usage"])
+        check("no top-level reasoning_tokens for vllm", "reasoning_tokens" not in r["usage"], r["usage"])
+        check("no prompt_tokens_details invented", "prompt_tokens_details" not in r["usage"], r["usage"])
+        print("  ", r_no_details)
+        check("leg2 without completion_tokens_details: built at the vllm position, leg2 counted as 0",
+              r_no_details["usage"]["completion_tokens_details"] == {"reasoning_tokens": recovered_reasoning},
+              r_no_details["usage"])
+        check("no top-level reasoning_tokens for vllm (no details case)",
+              "reasoning_tokens" not in r_no_details["usage"], r_no_details["usage"])
+
+        print("\n== vllm_multimodal_passthrough (CONTINUATION_ENGINE=vllm 时多模态请求不进续写) ==")
+        original_engine = gw_config.CONTINUATION_ENGINE
+        gw_config.CONTINUATION_ENGINE = "vllm"
+        try:
+            r = await call_gateway("vllm_multimodal_passthrough", extra={"messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what is in this image?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,fakeimagedata"}},
+                ]},
+            ]})
+        finally:
+            gw_config.CONTINUATION_ENGINE = original_engine
+        print("  ", r)
+        check("content from downstream verbatim (走的是 passthrough)",
+              r["content"] == "image reply, untouched.", r["content"])
+        check("finish_reason present (没有被 idle timeout 掐断)", r["finish_reason"] == "stop")
+        check("only 1 downstream call (没有触发续写编排)",
+              call_counts.get("vllm_multimodal_passthrough") == 1)
 
         print("\n== multimodal_continuation (多模态请求也走续写，usage 用减法公式) ==")
         r = await call_gateway("multimodal_continuation", extra={"messages": [

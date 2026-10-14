@@ -3,12 +3,28 @@
 [English](README.md) | 简体中文
 
 > [!IMPORTANT]
-> **目前仅支持 SGLang 作为推理引擎。** 暂不支持 vLLM：续写请求依赖
-> `continue_final_message` / `add_generation_prompt=false` 语义，SGLang 对此有统一实现，
-> 而 vLLM 把它交给各个模型自己的 chat template / tokenizer 处理，很多模型会直接忽略，
-> 或者无法接着一段不完整的回复往下续写。
+> 网关支持 **SGLang** 和 **vLLM** 两种推理引擎，通过 `CONTINUATION_ENGINE` 指定。本项目针对
+> 不同的「引擎 + 模型」组合各有对应的续写策略，目前已验证的组合如下：
+>
+> **SGLang**
+>
+> | 模型 | 状态 | 备注 |
+> | --- | --- | --- |
+> | Kimi-K3 | ✅ 已验证 | |
+> | Qwen3.6-35B-A3B | ✅ 已验证 | |
+> | GLM-5.3 | ✅ 已验证 | |
+>
+> **vLLM**
+>
+> | 模型 | 状态 | 备注 |
+> | --- | --- | --- |
+> | Qwen3.6-35B-A3B | ✅ 已验证 | |
+> | GLM-5.3 | ✅ 已验证 | |
+> | Kimi-K3 | ❌ 不支持 | |
+>
+> 其它模型和引擎尚未验证，可能可用，使用前请自行验证。我们仍在持续适配更多的引擎 + 模型组合。
 
-LLM 推理服务的崩溃续写网关：位于客户端和 OpenAI 兼容的推理服务（目前仅 SGLang，见上方说明）之间。
+LLM 推理服务的崩溃续写网关：位于客户端和 OpenAI 兼容的推理服务（SGLang 或 vLLM，见上方说明）之间。
 
 推理实例在流式生成中途可能崩溃、连接被重置，或者卡住（进程没死但不再吐 token）。客户端
 这时拿到的是一段被截断、没有 `finish_reason` 的回复，通常只能整体重试，已经生成的内容和
@@ -23,7 +39,7 @@ LLM 推理服务的崩溃续写网关：位于客户端和 OpenAI 兼容的推�
 ```
                                   leg1：原始请求
   client ──▶ continuation_gateway ─────────────────▶ 下游路由网关 ──▶ 推理实例
-     ▲         │  逐 chunk 转发 + 解析 SSE              (SGLang)
+     ▲         │  逐 chunk 转发 + 解析 SSE              (SGLang / vLLM)
      │         │  累积 reasoning / content
      │         │  检测卡住 / 断连（没见过 finish_reason）
      │         ▼
@@ -66,6 +82,7 @@ LLM 推理服务的崩溃续写网关：位于客户端和 OpenAI 兼容的推�
 - `response_format` 是 `json_object`/`json_schema` 的结构化输出：约束到的 JSON 内容混在
   普通 content chunk 里，没有独立信号能识别。
 - 客户端自己发的 `continue_final_message` 请求：不再叠加续写。
+- `CONTINUATION_ENGINE=vllm` 时，messages 里带非文本内容（图片、音频、视频）的请求。
 - 请求体超过 `MAX_CONTINUATION_BODY_MB`（默认多模态大 body）。
 
 ## 构建镜像
@@ -92,6 +109,7 @@ docker build -t continuation-gateway:latest \
 docker run --rm -p 8000:8000 \
     -e DOWNSTREAM_URL=http://<路由网关>:<port> \
     -e CONTINUATION_MODEL=<真实模型名> \
+    -e CONTINUATION_ENGINE=<sglang|vllm> \
     continuation-gateway:latest
 ```
 
@@ -104,7 +122,7 @@ docker run --rm -p 8000:8000 \
 
 ```bash
 DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODEL=<真实模型名> \
-    python -m continuation_gateway.server
+    CONTINUATION_ENGINE=<sglang|vllm> python -m continuation_gateway.server
 ```
 
 `CONTINUATION_MODEL` 是本部署下游实际 serve 的真实模型（例如 `kimi-k3`，大小写不敏感），**不是**
@@ -112,6 +130,9 @@ DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODEL=<真实模型名>
 模型不一定相符）。网关假定一个部署下游只有一种模型，这个值决定续写请求的前缀怎么拼，并对
 收到的所有请求一视同仁生效，不再按请求里的 `model` 过滤。不设置时网关不触发任何续写，所有请求
 原样透传。
+
+`CONTINUATION_ENGINE` 是下游背后的推理引擎，`sglang`（默认）或 `vllm`。哪些引擎 + 模型组合
+已经验证过，见文档开头的兼容性表格。
 
 可选环境变量（默认值见 `continuation_gateway/config.py`）：`PORT`、`CONTINUATION_URL`
 （续写请求单独打去另一个地址，不设置就跟 `DOWNSTREAM_URL` 一样）、`CONTINUATION_ENABLED`

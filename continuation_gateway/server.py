@@ -27,7 +27,7 @@ usage.py `correct_usage()` 顶部注释。这条判断跟大 body 排除（MAX_C
 交给下游网关负责，这一层不自己维护 SGLang 实例列表）：
 
     DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODEL=<真实模型名> \\
-        python -m continuation_gateway.server
+        CONTINUATION_ENGINE=<sglang|vllm> python -m continuation_gateway.server
 
 原始请求和续写请求默认打同一个 URL，可以用 CONTINUATION_URL 单独把续写请求（leg2）导到另一
 个地址；CONTINUATION_ENABLED=false 可以关掉"真的发第二条腿"这一步，只保留 leg1 的监测和
@@ -66,6 +66,9 @@ from .usage import estimate_recovered_tokens, rewrite_leg2_line
 if not config.DOWNSTREAM_URL:
     sys.exit("Set DOWNSTREAM_URL, e.g. DOWNSTREAM_URL=http://router.example.com:8050 "
              "python -m continuation_gateway.server")
+
+if config.CONTINUATION_ENGINE not in ("sglang", "vllm"):
+    sys.exit(f"CONTINUATION_ENGINE must be 'sglang' or 'vllm', got {config.CONTINUATION_ENGINE!r}")
 
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -130,6 +133,13 @@ def should_intervene(payload: dict, body_size: int) -> bool:
     if not config.CONTINUATION_MODEL:
         log.info("model=%s CONTINUATION_MODEL not configured, skipping continuation coverage "
                   "(passthrough only)", payload.get("model"))
+        return False
+    if config.CONTINUATION_ENGINE == "vllm" and _has_multimodal_content(payload):
+        # vLLM 把多模态请求的图片等内容展开成占位 token 后再进引擎，续写前缀拼在其后时，
+        # 多模态占位与 embedding 的对应关系没有已验证的保证；与其冒险让引擎处理出错，
+        # 不如这类请求直接透传。
+        log.info("multimodal request on vllm engine, skipping continuation coverage "
+                  "(passthrough only): model=%s", payload.get("model"))
         return False
     if (payload.get("response_format") or {}).get("type") in ("json_object", "json_schema"):
         # 结构化输出（json_object/json_schema）不进续写，且不打算靠改 SGLang 支持——这条跟
@@ -320,12 +330,13 @@ async def relay(downstream_content, out: web.StreamResponse, state: StreamState,
 
 async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: LineSplitter, recovered,
                       response_id: str, log_id: str, is_multimodal: bool = False,
-                      reasoning_field: str = None) -> tuple:
+                      reasoning_field: str = None, engine: str = "sglang") -> tuple:
     """续写腿：逐行转发（不是整块字节透传），因为带 usage 的那条 data 行、以及每一行的 id
     都要原地改写（id 改写见 usage.py:rewrite_leg2_line 顶部注释——续写腿是网关自己发起的
     新请求，下游会分配一个新 completion id，不改写的话客户端会看到 id 中途变化）。同样先
     无限等第一个 chunk 再开始用 idle timeout。is_multimodal 原样透传给 rewrite_leg2_line()，
-    决定 usage 修正的 prompt_tokens 走估算值还是从真实 leg2 prompt_tokens 减算。
+    决定 usage 修正的 prompt_tokens 走估算值还是从真实 leg2 prompt_tokens 减算；engine 透传
+    给 rewrite_leg2_line()，决定 usage 修正的 reasoning_tokens 写在哪个位置。
 
     单次续写策略下这条腿没有第三条腿可退，所以 idle timeout 在这里不该再有"结束这条腿"的
     效果——停下来也换不来任何补救动作，唯一自洽的选择是跟没有这层网关时一样继续等（下游
@@ -349,7 +360,7 @@ async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: Line
     for line in splitter.feed(chunk):
         feed_line(line, state)
         await out.write(rewrite_leg2_line(line, recovered, response_id, is_multimodal,
-                                                             reasoning_field) + b"\n")
+                                                             reasoning_field, engine) + b"\n")
 
     logged_stall = False
     while True:
@@ -358,7 +369,7 @@ async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: Line
             for line in splitter.feed(chunk):
                 feed_line(line, state)
                 await out.write(rewrite_leg2_line(line, recovered, response_id, is_multimodal,
-                                                             reasoning_field) + b"\n")
+                                                             reasoning_field, engine) + b"\n")
         reason = stall_reason[0]
         if reason.startswith("idle timeout"):
             if not logged_stall:
@@ -438,7 +449,7 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
     try:
         leg2_outcome, leg2_finished = await relay_leg2(downstream.content, out, splitter, recovered,
                                                          state.response_id, log_id, is_multimodal,
-                                                         state.reasoning_field)
+                                                         state.reasoning_field, config.CONTINUATION_ENGINE)
     finally:
         downstream.release()
     if leg2_finished:
@@ -765,9 +776,10 @@ def main():
     app.router.add_get("/health", health)
     app.router.add_route("*", "/{tail:.*}", catch_all)
     log.info("listening on 0.0.0.0:%d, forwarding to %s, continuation requests to %s "
-              "(continuation model: %s, continuation enabled: %s)",
+              "(continuation model: %s, engine: %s, continuation enabled: %s)",
               config.PORT, config.DOWNSTREAM_URL, config.CONTINUATION_URL,
-              config.CONTINUATION_MODEL or "<none configured>", config.CONTINUATION_ENABLED)
+              config.CONTINUATION_MODEL or "<none configured>", config.CONTINUATION_ENGINE,
+              config.CONTINUATION_ENABLED)
     # handler_cancellation=True：aiohttp 的默认值是 False，默认值下客户端断连时
     # RequestHandler.connection_lost() 不会 cancel 正在处理这个请求的 task（读
     # aiohttp/web_protocol.py 源码确认，`_task_handler.cancel()` 那行套在
