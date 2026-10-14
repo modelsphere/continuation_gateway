@@ -19,7 +19,6 @@ English | [简体中文](README.zh-CN.md)
 >
 > | Model | Status | Notes |
 > | --- | --- | --- |
-> | Qwen3.6-35B-A3B | ✅ Verified | |
 > | GLM-5.3 | ✅ Verified | |
 > | Kimi-K3 | ❌ Not supported | |
 >
