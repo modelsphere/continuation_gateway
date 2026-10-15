@@ -260,6 +260,42 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
             await resp.write(sse({"id": "chatcmpl-leg2", "choices": [], "usage": usage}))
             await resp.write(b"data: [DONE]\n\n")
 
+    elif scenario in ("vllm_qwen_content_done", "vllm_default_content_done"):
+        # content-done：engine=vllm 且模型是登记过的（qwen3.6-35b-a3b 及其衍生名字）时，续写请求
+        # 最后一条 assistant 消息必须是 reasoning / content 分开的结构化消息（`<think>R</think>C`
+        # 字符串会被 Qwen3.6 的模板重排，引擎以 400 拒绝）；其它模型仍是字符串前缀。
+        if call_n == 1:
+            await resp.write(sse({"id": "chatcmpl-leg1", "choices": [{"delta": {"reasoning": "let me think. "}}]}))
+            await resp.write(sse({"id": "chatcmpl-leg1", "choices": [{"delta": {"content": "The answer is par"}}]}))
+            await asyncio.sleep(5)
+        else:
+            assert body.get("continue_final_message") is True
+            last = body["messages"][-1]
+            if scenario == "vllm_qwen_content_done":
+                assert last == {"role": "assistant", "reasoning": "let me think. ",
+                                "content": "The answer is par"}, last
+            else:
+                assert last == {"role": "assistant",
+                                "content": "<think>let me think. </think>The answer is par"}, last
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [{"delta": {"content": "tial recovery."}}]}))
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [{"delta": {}, "finish_reason": "stop"}]}))
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [], "usage": {
+                "prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13}}))
+            await resp.write(b"data: [DONE]\n\n")
+
+    elif scenario == "vllm_qwen_thinking_partial":
+        # engine=vllm + 登记过的模型但 content 还没开始（thinking-partial）：仍然是字符串前缀。
+        if call_n == 1:
+            await resp.write(sse({"id": "chatcmpl-leg1", "choices": [{"delta": {"reasoning": "step one. "}}]}))
+            await asyncio.sleep(5)
+        else:
+            assert body["messages"][-1] == {"role": "assistant", "content": "<think>step one. "}, body["messages"][-1]
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [{"delta": {"reasoning": "step two"}}]}))
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [{"delta": {}, "finish_reason": "stop"}]}))
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [], "usage": {
+                "prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13}}))
+            await resp.write(b"data: [DONE]\n\n")
+
     elif scenario == "vllm_multimodal_passthrough":
         # engine=vllm 时多模态请求不进续写：下游卡住也不该被网关掐断去续写。
         await resp.write(sse({"choices": [{"delta": {"content": "image reply, untouched."}}]}))
@@ -659,6 +695,53 @@ async def main():
         check("no top-level reasoning_tokens for vllm (no details case)",
               "reasoning_tokens" not in r_no_details["usage"], r_no_details["usage"])
 
+        print("\n== vllm 下 content-done 的 assistant 消息形态（按引擎 + 模型型号选择） ==")
+        original_engine = gw_config.CONTINUATION_ENGINE
+        original_model = gw_config.CONTINUATION_MODEL
+        gw_config.CONTINUATION_ENGINE = "vllm"
+        try:
+            gw_config.CONTINUATION_MODEL = "qwen3.6-35b-a3b"
+            r_q = await call_gateway("vllm_qwen_content_done")
+            gw_config.CONTINUATION_MODEL = "Qwen3.6-35B-A3B"
+            call_counts["vllm_qwen_content_done"] = 0
+            r_q_variant = await call_gateway("vllm_qwen_content_done")
+            gw_config.CONTINUATION_MODEL = "qwen3.6-27b"
+            r_q27 = await call_gateway("vllm_default_content_done")
+            gw_config.CONTINUATION_MODEL = "qwen3.6-35b-a3b"
+            r_tp = await call_gateway("vllm_qwen_thinking_partial")
+            gw_config.CONTINUATION_ENGINE = "sglang"
+            call_counts["vllm_default_content_done"] = 0
+            r_sg = await call_gateway("vllm_default_content_done")
+        finally:
+            gw_config.CONTINUATION_ENGINE = original_engine
+            gw_config.CONTINUATION_MODEL = original_model
+        want = "The answer is partial recovery."
+        check("vllm + qwen3.6-35b-a3b content-done: structured message",
+              r_q["content"] == want and r_q["finish_reason"] == "stop", r_q["content"])
+        check("vllm + differently-cased name (Qwen3.6-35B-A3B): structured message",
+              r_q_variant["content"] == want and r_q_variant["finish_reason"] == "stop", r_q_variant["content"])
+        check("vllm + qwen3.6-27b (unverified, no match): string prefix",
+              r_q27["content"] == want and r_q27["finish_reason"] == "stop", r_q27["content"])
+        check("vllm + qwen3.6-35b-a3b thinking-partial: string prefix",
+              r_tp["reasoning"] == "step one. step two" and r_tp["finish_reason"] == "stop", r_tp["reasoning"])
+        check("sglang + qwen3.6-35b-a3b content-done: string prefix",
+              r_sg["content"] == want and r_sg["finish_reason"] == "stop", r_sg["content"])
+
+        print("\n== match_key：归一化后精确匹配 ==")
+        from continuation_gateway.reconstruct import KNOWN_MODELS, match_key
+        keys = ("glm-5", "kimi-k3", "qwen3.6-35b-a3b")
+        for name, want_key in [
+            ("kimi-k3", "kimi-k3"), ("Kimi-K3", "kimi-k3"), ("Kimi_K3", "kimi-k3"),
+            (" kimi-k3 ", "kimi-k3"), ("Qwen3.6-35B-A3B", "qwen3.6-35b-a3b"),
+            ("Kimi-K3-FP8", None), ("moonshotai/Kimi-K3", None), ("kimi-k30", None),
+            ("qwen3.6-27b", None), ("glm-5.3", None), ("glm-50", None), ("", None),
+        ]:
+            check(f"match_key({name!r}) == {want_key!r}", match_key(name, keys) == want_key,
+                  match_key(name, keys))
+        check("KNOWN_MODELS: GLM-5.3 matches, GLM-5.3-FP8 does not",
+              match_key("GLM-5.3", KNOWN_MODELS) == "glm-5.3"
+              and match_key("GLM-5.3-FP8", KNOWN_MODELS) is None)
+
         print("\n== vllm_multimodal_passthrough (CONTINUATION_ENGINE=vllm 时多模态请求不进续写) ==")
         original_engine = gw_config.CONTINUATION_ENGINE
         gw_config.CONTINUATION_ENGINE = "vllm"
@@ -847,15 +930,15 @@ async def main():
 
         print("\n== fault_injection_stall (续写阶段内部意外抛异常，网关不能崩) ==")
 
-        def _boom(model, reasoning, content):
+        def _boom(engine, model, reasoning, content):
             raise RuntimeError("simulated unexpected bug inside the continuation phase")
 
-        original_build_prefix = gw_server.build_prefix
-        gw_server.build_prefix = _boom
+        original_build_message = gw_server.build_assistant_message
+        gw_server.build_assistant_message = _boom
         try:
             r = await call_gateway("fault_injection_stall")
         finally:
-            gw_server.build_prefix = original_build_prefix
+            gw_server.build_assistant_message = original_build_message
         print("  ", r)
         check("client still gets leg1's partial content (not aborted)",
               r["content"] == "partial before injected fault.", r["content"])

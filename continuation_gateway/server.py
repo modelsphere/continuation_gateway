@@ -59,7 +59,13 @@ from aiohttp import (
 )
 
 from . import config
-from .reconstruct import build_prefix, classify_case, needs_thinking_disabled
+from .reconstruct import (
+    KNOWN_MODELS,
+    build_assistant_message,
+    classify_case,
+    match_key,
+    needs_thinking_disabled,
+)
 from .sse import LineSplitter, StreamState, feed_line, feed_line_holding
 from .usage import estimate_recovered_tokens, rewrite_leg2_line
 
@@ -392,7 +398,7 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
     # （tool_call_seen/no_recoverable_content 两个排除分支已经在 guarded() 里过滤掉，当前
     # 范围内 state.tool_calls_seen 到这里必然是 False，传它只是让这次调用跟 classify_case()
     # 的完整签名保持一致——以后 v2 如果放开 tool_call 场景也能真的走到这个函数，这里不用改），
-    # 目前实际只会落在 content-done/thinking-partial 二选一，直接决定了下面 build_prefix()
+    # 目前实际只会落在 content-done/thinking-partial 二选一，直接决定了下面 build_assistant_message()
     # 走哪个分支、needs_thinking_disabled() 是不是为真——跟 TRIGGERED 那行的 case 字段用的
     # 是同一份判断依据，两处应该总是一致的（除非 state.content 在两次调用之间被改过，不应该
     # 发生）。
@@ -408,10 +414,10 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
     # （不常见），两个都按扣减后的值改，避免下游到底读哪个字段产生歧义。
     budget_fields = [f for f in ("max_tokens", "max_completion_tokens") if original_payload.get(f) is not None]
 
-    prefix = build_prefix(config.CONTINUATION_MODEL, state.reasoning, state.content)
     continuation_payload = dict(original_payload)
     continuation_payload["messages"] = list(original_payload.get("messages", [])) + [
-        {"role": "assistant", "content": prefix}
+        build_assistant_message(config.CONTINUATION_ENGINE, config.CONTINUATION_MODEL,
+                                state.reasoning, state.content)
     ]
 
     if budget_fields:
@@ -775,6 +781,15 @@ def main():
     # /health 必须在 catch_all 的通配路由之前注册，否则会被 catch_all 透传到下游。
     app.router.add_get("/health", health)
     app.router.add_route("*", "/{tail:.*}", catch_all)
+    if config.CONTINUATION_MODEL:
+        matched = match_key(config.CONTINUATION_MODEL, KNOWN_MODELS)
+        if matched:
+            log.info("CONTINUATION_MODEL=%r matches verified model %r", config.CONTINUATION_MODEL, matched)
+        else:
+            log.warning("CONTINUATION_MODEL=%r is not a verified model name (%s); using the "
+                         "default <think>...</think> prefix format, please verify it against "
+                         "your model before relying on continuation",
+                         config.CONTINUATION_MODEL, ", ".join(KNOWN_MODELS))
     log.info("listening on 0.0.0.0:%d, forwarding to %s, continuation requests to %s "
               "(continuation model: %s, engine: %s, continuation enabled: %s)",
               config.PORT, config.DOWNSTREAM_URL, config.CONTINUATION_URL,

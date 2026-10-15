@@ -19,8 +19,14 @@ English | [简体中文](README.zh-CN.md)
 >
 > | Model | Status | Notes |
 > | --- | --- | --- |
+> | Qwen3.6-35B-A3B | ✅ Verified | |
 > | GLM-5.3 | ✅ Verified | |
 > | Kimi-K3 | ❌ Not supported | |
+>
+> The model names in the tables are exactly the strings `CONTINUATION_MODEL` should be set to
+> (case-insensitive, exact match). A quantized or fine-tuned variant of a listed model, such as
+> `GLM-5.3-FP8`, should use the listed name `GLM-5.3`; a different size or version
+> (`Qwen3.6-27B`, `GLM-5.4`) is a different model and is not matched.
 >
 > Other models and engines have not been verified; they may work, but please verify them
 > yourself before relying on them. We are continuing to adapt more engine + model
@@ -43,7 +49,10 @@ The way the prefix is assembled is determined by `CONTINUATION_MODEL` (the model
 deployment actually serves; the `model` field of the request is not consulted), see
 `continuation_gateway/reconstruct.py`. Two formats are built in: Kimi-K3 (XTML) and a generic
 `<think>...</think>` format. Supporting a model with another format only takes adding a
-builder there.
+builder there. A model that matches no verified model is handled with the generic format, and
+the gateway logs a warning at startup. On vLLM, Qwen3.6-35B-A3B additionally sends the
+content-done partial message as separate `reasoning` / `content` fields, because its chat
+template rewrites the string form and the engine then rejects it with a 400.
 
 ```
                                leg1: original request
