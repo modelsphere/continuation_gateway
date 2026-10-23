@@ -50,6 +50,7 @@ continuation_call_counts = {}  # 独立的假 downstream，专门验证 CONTINUA
 # 乖乖睡完——用它证明"客户端断连"这个信号真的传导到了网关正在等 leg1 第一个 chunk 的这个
 # task，而不只是"客户端自己放弃了"（那个不用靠这个 event 也能验证到）。
 downstream_cancel_event = asyncio.Event()
+expected_leg2_kwargs = {"value": None}  # content_done_thinking_switch 期望续写请求带的 chat_template_kwargs
 
 
 def sse(obj) -> bytes:
@@ -144,6 +145,23 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
             }}))
             await resp.write(b"data: [DONE]\n\n")
 
+    elif scenario == "content_done_thinking_switch":
+        # content-done：续写请求的 chat_template_kwargs 要把客户端原有的 kwargs 和关思考开关
+        # 合并（开关的 key 因模型而异，期望值由用例通过 expected_leg2_kwargs 给出）；leg2 故意上报
+        # 虚高的 reasoning_tokens（引擎的 parser 把整段 leg2 都计成 reasoning），网关不该采信。
+        if call_n == 1:
+            await resp.write(sse({"id": "chatcmpl-leg1", "choices": [{"delta": {"reasoning_content": "think. "}}]}))
+            await resp.write(sse({"id": "chatcmpl-leg1", "choices": [{"delta": {"content": "answer par"}}]}))
+            await asyncio.sleep(5)
+        else:
+            assert body.get("chat_template_kwargs") == expected_leg2_kwargs["value"], body.get("chat_template_kwargs")
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [{"delta": {"content": "tial."}}]}))
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [{"delta": {}, "finish_reason": "stop"}]}))
+            await resp.write(sse({"id": "chatcmpl-leg2", "choices": [], "usage": {
+                "prompt_tokens": 10, "completion_tokens": 119, "total_tokens": 129, "reasoning_tokens": 119,
+                "completion_tokens_details": {"reasoning_tokens": 119}}}))
+            await resp.write(b"data: [DONE]\n\n")
+
     elif scenario == "tool_call_seen_no_rescue":
         await resp.write(sse({"choices": [{"delta": {"tool_calls": [
             {"index": 0, "id": "x:0", "type": "function", "function": {"name": "f", "arguments": "{}"}}
@@ -192,7 +210,7 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
             assert "LEAKED" not in prefix and "leg1" not in prefix, prefix
             if with_content:
                 assert prefix == "<think>thinking. </think>I will call a tool. ", prefix
-                assert body.get("chat_template_kwargs") == {"thinking": False}
+                assert body.get("chat_template_kwargs") == {"thinking": False}  # test-model: 默认 key
             else:
                 assert prefix == "<think>thinking. ", prefix
                 assert body.get("chat_template_kwargs") is None
@@ -727,8 +745,55 @@ async def main():
         check("sglang + qwen3.6-35b-a3b content-done: string prefix",
               r_sg["content"] == want and r_sg["finish_reason"] == "stop", r_sg["content"])
 
+        print("\n== content-done 的关思考开关：合并客户端 kwargs、key 按模型区分；leg2 的 reasoning_tokens 不采信 ==")
+        recovered_reasoning = est("think. ")
+        original_engine = gw_config.CONTINUATION_ENGINE
+        original_model = gw_config.CONTINUATION_MODEL
+
+        async def run_switch(model, engine, client_kwargs, want_kwargs):
+            gw_config.CONTINUATION_MODEL, gw_config.CONTINUATION_ENGINE = model, engine
+            expected_leg2_kwargs["value"] = want_kwargs
+            call_counts["content_done_thinking_switch"] = 0
+            extra = {"chat_template_kwargs": client_kwargs} if client_kwargs is not None else None
+            return await call_gateway("content_done_thinking_switch", extra=extra)
+
+        try:
+            r = await run_switch("qwen3.6-35b-a3b", "sglang", {"enable_thinking": False, "foo": 1},
+                                 {"enable_thinking": False, "foo": 1})
+            check("qwen: client kwargs kept, enable_thinking merged in",
+                  r["content"] == "answer partial." and r["finish_reason"] == "stop", r)
+            check("sglang: leg2's inflated reasoning_tokens ignored (content-done)",
+                  r["usage"]["reasoning_tokens"] == recovered_reasoning, r["usage"])
+            r = await run_switch("qwen3.6-35b-a3b", "sglang", {"enable_thinking": True, "foo": 1},
+                                 {"enable_thinking": False, "foo": 1})
+            check("qwen: same key from client is overridden by the gateway",
+                  r["content"] == "answer partial." and r["finish_reason"] == "stop", r)
+            r = await run_switch("qwen3.6-35b-a3b", "sglang", None, {"enable_thinking": False})
+            check("qwen: no client kwargs -> only the switch",
+                  r["content"] == "answer partial." and r["finish_reason"] == "stop", r)
+            r = await run_switch("kimi-k3", "sglang", {"foo": 1}, {"foo": 1, "thinking": False})
+            check("kimi-k3: `thinking` key",
+                  r["content"] == "answer partial." and r["finish_reason"] == "stop", r)
+            r = await run_switch("some-unknown-model", "sglang", {"foo": 1}, {"foo": 1, "thinking": False})
+            check("unknown model: default `thinking` key",
+                  r["content"] == "answer partial." and r["finish_reason"] == "stop", r)
+            r = await run_switch("deepseek-v4-flash-0731-nvfp4", "vllm", None, {"thinking": False})
+            check("vllm: leg2's inflated completion_tokens_details.reasoning_tokens ignored (content-done)",
+                  r["usage"]["completion_tokens_details"] == {"reasoning_tokens": recovered_reasoning}
+                  and "reasoning_tokens" not in r["usage"], r["usage"])
+        finally:
+            gw_config.CONTINUATION_ENGINE = original_engine
+            gw_config.CONTINUATION_MODEL = original_model
+
+        from continuation_gateway.reconstruct import thinking_disable_kwargs
+        check("thinking-partial (empty content): no switch",
+              thinking_disable_kwargs("qwen3.6-35b-a3b", "") == {}
+              and thinking_disable_kwargs("kimi-k3", "") == {})
+        check("Qwen3.6-35B-A3B name variant resolves to enable_thinking",
+              thinking_disable_kwargs("Qwen3.6-35B-A3B", "x") == {"enable_thinking": False})
+
         print("\n== match_key：归一化后精确匹配 ==")
-        from continuation_gateway.reconstruct import KNOWN_MODELS, match_key
+        from continuation_gateway.reconstruct import VERIFIED_MODELS, match_key
         keys = ("glm-5", "kimi-k3", "qwen3.6-35b-a3b")
         for name, want_key in [
             ("kimi-k3", "kimi-k3"), ("Kimi-K3", "kimi-k3"), ("Kimi_K3", "kimi-k3"),
@@ -738,9 +803,15 @@ async def main():
         ]:
             check(f"match_key({name!r}) == {want_key!r}", match_key(name, keys) == want_key,
                   match_key(name, keys))
-        check("KNOWN_MODELS: GLM-5.3 matches, GLM-5.3-FP8 does not",
-              match_key("GLM-5.3", KNOWN_MODELS) == "glm-5.3"
-              and match_key("GLM-5.3-FP8", KNOWN_MODELS) is None)
+        sg, vl = VERIFIED_MODELS["sglang"], VERIFIED_MODELS["vllm"]
+        check("VERIFIED_MODELS: GLM-5.3 matches, GLM-5.3-FP8 does not",
+              match_key("GLM-5.3", sg) == "glm-5.3" and match_key("GLM-5.3-FP8", sg) is None)
+        check("VERIFIED_MODELS: DeepSeek-V4-Flash-0731-NVFP4 verified on vllm only",
+              match_key("DeepSeek-V4-Flash-0731-NVFP4", vl) == "deepseek-v4-flash-0731-nvfp4"
+              and match_key("deepseek-v4-flash-0731", vl) is None
+              and match_key("deepseek-v4-flash-0731-nvfp4", sg) is None)
+        check("VERIFIED_MODELS: Kimi-K3 verified on sglang only",
+              match_key("kimi-k3", sg) == "kimi-k3" and match_key("kimi-k3", vl) is None)
 
         print("\n== vllm_multimodal_passthrough (CONTINUATION_ENGINE=vllm 时多模态请求不进续写) ==")
         original_engine = gw_config.CONTINUATION_ENGINE

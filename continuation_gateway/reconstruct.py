@@ -60,9 +60,23 @@ _BUILDERS = {
     "kimi-k3": _build_prefix_kimi_k3,
 }
 
-# 已验证过的模型型号（README 兼容表里的模型名）。只用于启动时判断 CONTINUATION_MODEL 有没有
-# 对上已知型号；没有专门 builder 的型号（如 glm-5.3）走默认 <think> 格式，也在这里登记。
-KNOWN_MODELS = ("kimi-k3", "qwen3.6-35b-a3b", "glm-5.3")
+# 已验证过的「引擎 -> 模型型号」组合（README 兼容表里的模型名）。只用于启动时判断
+# CONTINUATION_MODEL 在当前 CONTINUATION_ENGINE 上有没有验证过，不参与任何分发；没有专门
+# builder 的型号（如 glm-5.3）走默认 <think> 格式，也在这里登记。Kimi-K3 在 vLLM 上不支持，
+# 所以不在 vllm 一栏。
+VERIFIED_MODELS = {
+    "sglang": ("kimi-k3", "qwen3.6-35b-a3b", "glm-5.3"),
+    "vllm": ("qwen3.6-35b-a3b", "glm-5.3", "deepseek-v4-flash-0731-nvfp4"),
+}
+
+# 关思考开关在 chat_template_kwargs 里的 key：默认 `thinking`，Qwen3 系的模板读的是
+# `enable_thinking`（对 `thinking` 无反应），在这里登记。续写下游约定是裸引擎 URL，模板变量
+# 只能通过 chat_template_kwargs 传入，所以只有这一种写法。每个模型只发一个 key：有的模型
+# 收到不认识的开关会把 reasoning 漏进 content。
+_DEFAULT_THINKING_SWITCH_KEY = "thinking"
+_THINKING_SWITCH_KEYS = {
+    "qwen3.6-35b-a3b": "enable_thinking",
+}
 
 # 引擎 -> 该引擎上 content-done 需要发结构化消息的模型型号。
 _STRUCTURED_CONTENT_DONE = {
@@ -106,11 +120,17 @@ def build_assistant_message(engine: str, model: str, reasoning: str, content: st
     return {"role": "assistant", "content": build_prefix(model, reasoning, content)}
 
 
-def needs_thinking_disabled(content: str) -> bool:
-    """对应 continuation_test.py 里的 DISABLE_THINKING：content 已经在生成，说明 thinking
-    这一步该关了；content 还没开始，说明还得让模型自己接着想，不能关。这条跟用哪套
-    build_prefix 无关，不用按 model 分派。"""
-    return bool(content)
+def thinking_disable_kwargs(model: str, content: str) -> dict:
+    """续写请求需要合并进 chat_template_kwargs 的「关思考」开关。
+
+    content 已经在生成，说明 thinking 这一步该关了；content 还没开始，说明还得让模型自己
+    接着想，不能关，返回空字典。开关的 key 因模型的 chat template 而异，只发一个：
+    _THINKING_SWITCH_KEYS 登记了与默认 `thinking` 不同的模型，其它模型（包括 Kimi-K3、没有
+    外部开关的 GLM-5.3，以及未验证的模型）用 `thinking`——模板里没有引用的变量会被忽略。"""
+    if not content:
+        return {}
+    key = _THINKING_SWITCH_KEYS.get(match_key(model, _THINKING_SWITCH_KEYS), _DEFAULT_THINKING_SWITCH_KEY)
+    return {key: False}
 
 
 def classify_case(tool_calls_seen: bool, reasoning: str, content: str) -> str:
@@ -142,7 +162,7 @@ def classify_case(tool_calls_seen: bool, reasoning: str, content: str) -> str:
       跟 "content-done"/"thinking-partial" 明确要求"确实见过对应内容"的语义是互斥的，
       不该被套用成其中任何一个。
 
-    跟 build_prefix()/needs_thinking_disabled() 用的是同一条 content 判断依据，这里单独
+    跟 build_prefix()/thinking_disable_kwargs() 用的是同一条 content 判断依据，这里单独
     抽出来是为了让日志打印和实际选用的前缀构造分支共用同一份逻辑，避免各算一遍悄悄不一致。
 
     以后 v2 如果真的支持 tool_call 续写，大概率要在 "tool-call-seen" 这一档基础上再细分

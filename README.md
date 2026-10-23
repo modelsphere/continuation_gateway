@@ -21,6 +21,7 @@ English | [简体中文](README.zh-CN.md)
 > | --- | --- | --- |
 > | Qwen3.6-35B-A3B | ✅ Verified | |
 > | GLM-5.3 | ✅ Verified | |
+> | DeepSeek-V4-Flash-0731-NVFP4 | ✅ Verified | |
 > | Kimi-K3 | ❌ Not supported | |
 >
 > The model names in the tables are exactly the strings `CONTINUATION_MODEL` should be set to
