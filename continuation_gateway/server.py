@@ -59,7 +59,13 @@ from aiohttp import (
 )
 
 from . import config
-from .reconstruct import build_prefix, classify_case, needs_thinking_disabled
+from .reconstruct import (
+    VERIFIED_MODELS,
+    build_assistant_message,
+    classify_case,
+    match_key,
+    thinking_disable_kwargs,
+)
 from .sse import LineSplitter, StreamState, feed_line, feed_line_holding
 from .usage import estimate_recovered_tokens, rewrite_leg2_line
 
@@ -392,8 +398,8 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
     # （tool_call_seen/no_recoverable_content 两个排除分支已经在 guarded() 里过滤掉，当前
     # 范围内 state.tool_calls_seen 到这里必然是 False，传它只是让这次调用跟 classify_case()
     # 的完整签名保持一致——以后 v2 如果放开 tool_call 场景也能真的走到这个函数，这里不用改），
-    # 目前实际只会落在 content-done/thinking-partial 二选一，直接决定了下面 build_prefix()
-    # 走哪个分支、needs_thinking_disabled() 是不是为真——跟 TRIGGERED 那行的 case 字段用的
+    # 目前实际只会落在 content-done/thinking-partial 二选一，直接决定了下面 build_assistant_message()
+    # 走哪个分支、thinking_disable_kwargs() 是不是非空——跟 TRIGGERED 那行的 case 字段用的
     # 是同一份判断依据，两处应该总是一致的（除非 state.content 在两次调用之间被改过，不应该
     # 发生）。
     case = classify_case(state.tool_calls_seen, state.reasoning, state.content)
@@ -408,10 +414,10 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
     # （不常见），两个都按扣减后的值改，避免下游到底读哪个字段产生歧义。
     budget_fields = [f for f in ("max_tokens", "max_completion_tokens") if original_payload.get(f) is not None]
 
-    prefix = build_prefix(config.CONTINUATION_MODEL, state.reasoning, state.content)
     continuation_payload = dict(original_payload)
     continuation_payload["messages"] = list(original_payload.get("messages", [])) + [
-        {"role": "assistant", "content": prefix}
+        build_assistant_message(config.CONTINUATION_ENGINE, config.CONTINUATION_MODEL,
+                                state.reasoning, state.content)
     ]
 
     if budget_fields:
@@ -430,8 +436,11 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
     continuation_payload["add_generation_prompt"] = False
     continuation_payload["stream"] = True
     continuation_payload["stream_options"] = {"include_usage": True}
-    if needs_thinking_disabled(state.content):
-        continuation_payload["chat_template_kwargs"] = {"thinking": False}
+    disable_kwargs = thinking_disable_kwargs(config.CONTINUATION_MODEL, state.content)
+    if disable_kwargs:
+        # 合并进客户端原有的 chat_template_kwargs，同名 key 以网关为准。
+        continuation_payload["chat_template_kwargs"] = {
+            **(original_payload.get("chat_template_kwargs") or {}), **disable_kwargs}
 
     try:
         downstream = await session.post(target, headers=headers, json=continuation_payload,
@@ -775,6 +784,17 @@ def main():
     # /health 必须在 catch_all 的通配路由之前注册，否则会被 catch_all 透传到下游。
     app.router.add_get("/health", health)
     app.router.add_route("*", "/{tail:.*}", catch_all)
+    if config.CONTINUATION_MODEL:
+        verified = VERIFIED_MODELS.get(config.CONTINUATION_ENGINE, ())
+        matched = match_key(config.CONTINUATION_MODEL, verified)
+        if matched:
+            log.info("CONTINUATION_MODEL=%r on engine %s matches verified model %r",
+                     config.CONTINUATION_MODEL, config.CONTINUATION_ENGINE, matched)
+        else:
+            log.warning("CONTINUATION_MODEL=%r on engine %s is not a verified combination "
+                         "(verified on this engine: %s); please verify it against your model "
+                         "before relying on continuation",
+                         config.CONTINUATION_MODEL, config.CONTINUATION_ENGINE, ", ".join(verified))
     log.info("listening on 0.0.0.0:%d, forwarding to %s, continuation requests to %s "
               "(continuation model: %s, engine: %s, continuation enabled: %s)",
               config.PORT, config.DOWNSTREAM_URL, config.CONTINUATION_URL,

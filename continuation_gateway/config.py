@@ -13,7 +13,8 @@ CONTINUATION_URL = (os.environ.get("CONTINUATION_URL", "").rstrip("/") or DOWNST
 # 模型、一种引擎，续写的前缀构造方案（见 reconstruct.py）完全由这个值决定，对该部署收到的所有
 # 请求一视同仁，不再看请求体里的 model 字段——推理引擎的 --served-model-name 可以任意指定，
 # 跟真实模型不一定相符，请求里的 model 只是对外的服务名，不能用来判断该用哪套前缀格式。
-# 大小写不敏感（存小写）。不设置时默认空——什么都不触发、所有请求原样透传，逼着部署时显式
+# 大小写不敏感（存小写），与 reconstruct.py 里登记的型号精确匹配（量化版、微调版也填该型号的名字）。
+# 不设置时默认空——什么都不触发、所有请求原样透传，逼着部署时显式
 # 声明，避免没配置时静默套用一个可能不匹配的前缀格式。
 CONTINUATION_MODEL = os.environ.get("CONTINUATION_MODEL", "").strip().lower()
 

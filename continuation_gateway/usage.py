@@ -24,12 +24,16 @@ _CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힣豈-﫿]")
 
 
 class RecoveredTokens:
-    __slots__ = ("prompt_tokens", "reasoning_tokens", "content_tokens")
+    """leg1 里已经转发给客户端的那部分内容的 token 估算。thinking_closed 为 True 表示续写前缀
+    里思考已经闭合（content-done），续写腿生成的全是 content，不再产生 reasoning。"""
+    __slots__ = ("prompt_tokens", "reasoning_tokens", "content_tokens", "thinking_closed")
 
-    def __init__(self, prompt_tokens: int, reasoning_tokens: int, content_tokens: int):
+    def __init__(self, prompt_tokens: int, reasoning_tokens: int, content_tokens: int,
+                 thinking_closed: bool = False):
         self.prompt_tokens = prompt_tokens
         self.reasoning_tokens = reasoning_tokens
         self.content_tokens = content_tokens
+        self.thinking_closed = thinking_closed
 
     @property
     def total_recovered(self) -> int:
@@ -82,7 +86,8 @@ def estimate_recovered_tokens(original_payload: dict, reasoning_text: str, conte
     prompt_tokens = estimate_tokens(_prompt_text(original_payload), cjk_chars_per_token, other_chars_per_token)
     reasoning_tokens = estimate_tokens(reasoning_text, cjk_chars_per_token, other_chars_per_token)
     content_tokens = estimate_tokens(content_text, cjk_chars_per_token, other_chars_per_token)
-    return RecoveredTokens(prompt_tokens, reasoning_tokens, content_tokens)
+    return RecoveredTokens(prompt_tokens, reasoning_tokens, content_tokens,
+                           thinking_closed=bool(content_text))
 
 
 def correct_usage(recovered: RecoveredTokens, final_leg_usage: dict, is_multimodal: bool = False,
@@ -119,13 +124,17 @@ def correct_usage(recovered: RecoveredTokens, final_leg_usage: dict, is_multimod
     # 就按 0 算），只是位置不同：SGLang 在 usage 顶层，vLLM 在 completion_tokens_details 里。
     # 不能按 leg2 的形状判断位置：vLLM 没启用 reasoning parser 时整个字段缺失，缺失时也要
     # 构造在 vLLM 约定的位置上。
+    # 例外是思考已经闭合的续写（thinking_closed，content-done）：leg2 生成的全是 content，
+    # 真实 reasoning 为 0，但引擎的 reasoning parser 可能把整段 leg2 都计成 reasoning（它看
+    # 不到前缀里的闭合标签），所以不采信 leg2 上报的值，只用被救回的 reasoning 估算。
     if engine == "vllm":
         completion_details = dict(final_leg_usage.get("completion_tokens_details") or {})
-        completion_details["reasoning_tokens"] = (
-            completion_details.get("reasoning_tokens", 0) + recovered.reasoning_tokens)
+        leg2_reasoning = 0 if recovered.thinking_closed else completion_details.get("reasoning_tokens", 0)
+        completion_details["reasoning_tokens"] = leg2_reasoning + recovered.reasoning_tokens
         corrected["completion_tokens_details"] = completion_details
     else:
-        corrected["reasoning_tokens"] = final_leg_usage.get("reasoning_tokens", 0) + recovered.reasoning_tokens
+        leg2_reasoning = 0 if recovered.thinking_closed else final_leg_usage.get("reasoning_tokens", 0)
+        corrected["reasoning_tokens"] = leg2_reasoning + recovered.reasoning_tokens
     details = final_leg_usage.get("prompt_tokens_details")
     if details:
         details = dict(details)

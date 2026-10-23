@@ -6,12 +6,23 @@ _build_prefix_think_tag（<think>...</think> 格式）：这是目前已知模�
 的通用写法，但不保证覆盖所有未来接入的模型，真遇到别的格式要在这里加一个专门的 builder，
 不要指望默认格式蒙对。
 
+模型名按 match_key() 匹配：归一化（大小写、空白、下划线）后精确匹配。表里的 key 就是已验证的
+完整型号，也是 CONTINUATION_MODEL 应该设置的字符串；已验证模型的量化版、微调版也应该直接
+设置成该型号的名字（如 GLM-5.3-FP8 设置成 glm-5.3），没验证过的型号和版本不会被误命中。
+
+除了前缀格式，还有一类「引擎 + 模型」组合的特例：vLLM 的 continue_final_message 要求最后
+一条消息的 content 原样出现在渲染后的 prompt 里，有的模板会重排 `<think>R</think>C`，让整串
+字符串前缀被引擎以 400 拒绝，这类组合在 content-done 时改发 reasoning / content 分开的结构化
+消息，见 _STRUCTURED_CONTENT_DONE 和 build_assistant_message()。
+
 当前只覆盖自由文本、且崩溃时还没出现过 tool_call chunk 的情况，所以运行时只需要判断
 content 是否非空：非空说明 thinking 阶段已经结束（content-done），为空则保守按"可能还在
 thinking"处理（thinking-partial）——这条对所有 builder 都成立，不是 K3 专属。tool_call
 场景、以及 response_format 是 json_object/json_schema 的结构化输出场景，都在 server.py
 里更早的地方被排除掉了（前者是崩溃时才发现，后者从原始请求就能判断），走不到这里。
 """
+
+import re
 
 XTML_OPEN = "<|open|>"
 XTML_CLOSE = "<|close|>"
@@ -49,17 +60,77 @@ _BUILDERS = {
     "kimi-k3": _build_prefix_kimi_k3,
 }
 
+# 已验证过的「引擎 -> 模型型号」组合（README 兼容表里的模型名）。只用于启动时判断
+# CONTINUATION_MODEL 在当前 CONTINUATION_ENGINE 上有没有验证过，不参与任何分发；没有专门
+# builder 的型号（如 glm-5.3）走默认 <think> 格式，也在这里登记。Kimi-K3 在 vLLM 上不支持，
+# 所以不在 vllm 一栏。
+VERIFIED_MODELS = {
+    "sglang": ("kimi-k3", "qwen3.6-35b-a3b", "glm-5.3"),
+    "vllm": ("qwen3.6-35b-a3b", "glm-5.3", "deepseek-v4-flash-0731-nvfp4"),
+}
+
+# 关思考开关在 chat_template_kwargs 里的 key：默认 `thinking`，Qwen3 系的模板读的是
+# `enable_thinking`（对 `thinking` 无反应），在这里登记。续写下游约定是裸引擎 URL，模板变量
+# 只能通过 chat_template_kwargs 传入，所以只有这一种写法。每个模型只发一个 key：有的模型
+# 收到不认识的开关会把 reasoning 漏进 content。
+_DEFAULT_THINKING_SWITCH_KEY = "thinking"
+_THINKING_SWITCH_KEYS = {
+    "qwen3.6-35b-a3b": "enable_thinking",
+}
+
+# 引擎 -> 该引擎上 content-done 需要发结构化消息的模型型号。
+_STRUCTURED_CONTENT_DONE = {
+    "vllm": ("qwen3.6-35b-a3b",),
+}
+
+
+def _normalize(name: str) -> str:
+    return re.sub(r"[\s_]+", "-", (name or "").strip().lower())
+
+
+def match_key(model: str, keys) -> str:
+    """model 归一化后与 keys 里的某个 key 相等则返回该 key，否则返回 None。"""
+    name = _normalize(model)
+    for key in keys:
+        if _normalize(key) == name:
+            return key
+    return None
+
 
 def build_prefix(model: str, reasoning: str, content: str) -> str:
-    builder = _BUILDERS.get((model or "").lower(), _build_prefix_think_tag)
+    builder = _BUILDERS.get(match_key(model, _BUILDERS), _build_prefix_think_tag)
     return builder(reasoning, content)
 
 
-def needs_thinking_disabled(content: str) -> bool:
-    """对应 continuation_test.py 里的 DISABLE_THINKING：content 已经在生成，说明 thinking
-    这一步该关了；content 还没开始，说明还得让模型自己接着想，不能关。这条跟用哪套
-    build_prefix 无关，不用按 model 分派。"""
-    return bool(content)
+def build_assistant_message(engine: str, model: str, reasoning: str, content: str) -> dict:
+    """续写请求末尾那条 partial assistant 消息。
+
+    默认就是 build_prefix() 拼出的字符串前缀。_STRUCTURED_CONTENT_DONE 里登记的「引擎 + 模型」
+    且 content 已经开始（content-done）时例外：改成 reasoning / content 分开的结构化消息。
+    原因是 continue_final_message 在渲染 chat template 之后，要求最后一条消息的 content 原样
+    出现在渲染结果里，否则引擎直接拒绝请求（400）。有的模板（比如 Qwen3.6）会把 content 里的
+    `<think>R</think>C` 拆开重排，在 `<think>` 后和 `</think>` 前后补换行并去掉首尾空白，整段
+    字符串就不再原样出现；而 reasoning 单独传时，模板按 reasoning_content 渲染思考部分，
+    content 只剩正文 C，原样出现，截断位置恰好在 C 末尾。
+    thinking-partial（content 为空）没有 `</think>`，模板不会重排，仍然用字符串前缀；结构化
+    消息也表达不了「思考还没结束」，模板会把 think 闭合。
+    """
+    if content and match_key(model, _STRUCTURED_CONTENT_DONE.get(engine, ())):
+        return {"role": "assistant", "reasoning": reasoning, "content": content}
+    return {"role": "assistant", "content": build_prefix(model, reasoning, content)}
+
+
+def thinking_disable_kwargs(model: str, content: str) -> dict:
+    """续写请求需要合并进 chat_template_kwargs 的「关思考」开关。
+
+    content 已经在生成，说明 thinking 这一步该关了；content 还没开始，说明还得让模型自己
+    接着想，不能关，返回空字典。开关的 key 因模型的 chat template 而异，只发一个：
+    _THINKING_SWITCH_KEYS 登记了与默认 `thinking` 不同的模型，其它模型（包括 Kimi-K3、没有
+    外部开关的 GLM-5.3，以及未验证的模型）用 `thinking`——模板里没有引用的变量会被忽略。"""
+    if not content:
+        return {}
+    key = _THINKING_SWITCH_KEYS.get(match_key(model, _THINKING_SWITCH_KEYS), _DEFAULT_THINKING_SWITCH_KEY)
+    return {key: False}
 
 
 def classify_case(tool_calls_seen: bool, reasoning: str, content: str) -> str:
@@ -91,7 +162,7 @@ def classify_case(tool_calls_seen: bool, reasoning: str, content: str) -> str:
       跟 "content-done"/"thinking-partial" 明确要求"确实见过对应内容"的语义是互斥的，
       不该被套用成其中任何一个。
 
-    跟 build_prefix()/needs_thinking_disabled() 用的是同一条 content 判断依据，这里单独
+    跟 build_prefix()/thinking_disable_kwargs() 用的是同一条 content 判断依据，这里单独
     抽出来是为了让日志打印和实际选用的前缀构造分支共用同一份逻辑，避免各算一遍悄悄不一致。
 
     以后 v2 如果真的支持 tool_call 续写，大概率要在 "tool-call-seen" 这一档基础上再细分
