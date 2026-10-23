@@ -20,6 +20,7 @@ English | [简体中文](README.zh-CN.md)
 > | Model | Status | Notes |
 > | --- | --- | --- |
 > | GLM-5.3 | ✅ Verified | |
+> | DeepSeek-V4-Flash-0731-nvfp4 | ✅ Verified | |
 > | Kimi-K3 | ❌ Not supported | |
 >
 > Other models and engines have not been verified; they may work, but please verify them
