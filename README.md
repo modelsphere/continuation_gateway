@@ -22,7 +22,7 @@ English | [简体中文](README.zh-CN.md)
 > | Qwen3.6-35B-A3B | ✅ Verified | |
 > | GLM-5.3 | ✅ Verified | |
 > | DeepSeek-V4-Flash-0731-nvfp4 | ✅ Verified | |
-> | Kimi-K3 | ❌ Not supported | |
+> | Kimi-K3 | ✅ Verified | vLLM must be started with `--enable-scale-out`, otherwise continuation does not work. Multimodal requests are not continued |
 >
 > The model names in the tables are exactly the strings `CONTINUATION_MODEL` should be set to
 > (case-insensitive, exact match). A quantized or fine-tuned variant of a listed model, such as
@@ -184,6 +184,14 @@ actually issue the second leg — useful for verifying the monitoring path itsel
 real continuation load to the downstream), `STALL_IDLE_TIMEOUT_SECONDS`,
 `CONNECT_TIMEOUT_SECONDS`, `MAX_CONTINUATION_BODY_MB`, `MAX_REQUEST_BODY_MB`,
 `CJK_CHARS_PER_TOKEN`, `OTHER_CHARS_PER_TOKEN`.
+
+`DERENDER_BATCH_CHUNKS` (default `8`, minimum `1`) only applies to the combination whose
+continuation leg uses render-generate (vLLM + Kimi-K3): that leg runs render, tokenize,
+`/inference/v1/generate` and derender against `CONTINUATION_URL`, so the address must expose
+all four endpoints (the vLLM server needs `--enable-scale-out`). Each derender call replays all
+previously generated tokens, so the generated chunks are batched, `DERENDER_BATCH_CHUNKS` of
+them per call; the remainder is flushed when the final chunk (the one carrying `finish_reason`)
+arrives. A larger value means fewer derender calls but a more bursty stream.
 
 `BUFFER_TOOL_CALLS` (default `false`; behavior is unchanged when off; it only takes effect
 when `CONTINUATION_ENABLED=true`, see below): once a chunk carrying `tool_calls` appears on

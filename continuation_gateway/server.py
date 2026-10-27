@@ -23,6 +23,10 @@ token 的图片请求，估算结果只有 12）；`_has_multimodal_content()` �
 usage.py `correct_usage()` 顶部注释。这条判断跟大 body 排除（MAX_CONTINUATION_BODY_MB）
 互不影响——多模态请求如果 body 超限，仍然会被那条规则挡在续写范畴外，两条规则各管各的。
 
+vLLM + Kimi-K3 的续写腿不走 chat-continue（K3 的渲染器不认 continue_final_message），改成
+render → tokenize → generate → derender 四步，见 render_generate.py 和 reconstruct.uses_render_generate()；
+leg1 的监测、BUFFER_TOOL_CALLS、前置排除条件（包括 vLLM 下多模态请求透传）都和其它组合一致。
+
 跑法（下游预期是一个机房/集群路由网关，不是直连某个具体 SGLang 实例；实例选择/避开故障实例
 交给下游网关负责，这一层不自己维护 SGLang 实例列表）：
 
@@ -65,7 +69,9 @@ from .reconstruct import (
     classify_case,
     match_key,
     thinking_disable_kwargs,
+    uses_render_generate,
 )
+from .render_generate import RenderGenerateError, run_render_generate
 from .sse import LineSplitter, StreamState, feed_line, feed_line_holding
 from .usage import estimate_recovered_tokens, rewrite_leg2_line
 
@@ -386,6 +392,26 @@ async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: Line
         return reason, state.finish_reason is not None
 
 
+async def attempt_render_generate(session: ClientSession, headers: dict, original_payload: dict,
+                                  state: StreamState, out: web.StreamResponse, log_id: str, case: str,
+                                  recovered, remaining_budget) -> None:
+    """续写腿的 render-generate 版本（vLLM + Kimi-K3，见 render_generate.py）。预算和 usage 修正
+    用的 recovered / remaining_budget 由 attempt_continuation() 和 chat-continue 路径用同一套逻辑
+    算好；这里只负责把结果记成和 chat-continue 路径同一套 FAILED/SUCCEEDED 日志，下游的日志关联
+    工具不用区分。"""
+    try:
+        leg2_outcome, leg2_finished = await run_render_generate(
+            session, headers, original_payload, state, out, recovered, remaining_budget, log_id)
+    except RenderGenerateError as e:
+        log.warning("[continuation req=%s] FAILED reason=%s case=%s %s", log_id, e.reason, case, e.detail)
+        return
+    if leg2_finished:
+        log.info("[continuation req=%s] SUCCEEDED case=%s leg2_outcome=%s", log_id, case, leg2_outcome)
+    else:
+        log.warning("[continuation req=%s] FAILED reason=leg2_incomplete case=%s leg2_outcome=%s",
+                    log_id, case, leg2_outcome)
+
+
 async def attempt_continuation(session: ClientSession, target: str, headers: dict, original_payload: dict,
                                 state: StreamState, out: web.StreamResponse, log_id: str) -> None:
     recovered = estimate_recovered_tokens(original_payload, state.reasoning, state.content,
@@ -414,12 +440,7 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
     # （不常见），两个都按扣减后的值改，避免下游到底读哪个字段产生歧义。
     budget_fields = [f for f in ("max_tokens", "max_completion_tokens") if original_payload.get(f) is not None]
 
-    continuation_payload = dict(original_payload)
-    continuation_payload["messages"] = list(original_payload.get("messages", [])) + [
-        build_assistant_message(config.CONTINUATION_ENGINE, config.CONTINUATION_MODEL,
-                                state.reasoning, state.content)
-    ]
-
+    remaining_budget = None
     if budget_fields:
         original_budget = original_payload[budget_fields[0]]
         remaining_budget = original_budget - recovered.total_recovered
@@ -428,9 +449,20 @@ async def attempt_continuation(session: ClientSession, target: str, headers: dic
                       log_id, original_budget, recovered.total_recovered)
             return
         log.info("[continuation req=%s] budget original=%d remaining=%d", log_id, original_budget, remaining_budget)
-        for field in budget_fields:
-            continuation_payload[field] = remaining_budget
     # else: 客户端原始请求没有限制 token 数，续写请求也不设——不无中生有一个默认预算。
+
+    if uses_render_generate(config.CONTINUATION_ENGINE, config.CONTINUATION_MODEL):
+        await attempt_render_generate(session, headers, original_payload, state, out, log_id, case,
+                                      recovered, remaining_budget)
+        return
+
+    continuation_payload = dict(original_payload)
+    continuation_payload["messages"] = list(original_payload.get("messages", [])) + [
+        build_assistant_message(config.CONTINUATION_ENGINE, config.CONTINUATION_MODEL,
+                                state.reasoning, state.content)
+    ]
+    for field in budget_fields:
+        continuation_payload[field] = remaining_budget
 
     continuation_payload["continue_final_message"] = True
     continuation_payload["add_generation_prompt"] = False
@@ -800,6 +832,10 @@ def main():
               config.PORT, config.DOWNSTREAM_URL, config.CONTINUATION_URL,
               config.CONTINUATION_MODEL or "<none configured>", config.CONTINUATION_ENGINE,
               config.CONTINUATION_ENABLED)
+    if uses_render_generate(config.CONTINUATION_ENGINE, config.CONTINUATION_MODEL):
+        log.info("continuation leg2 uses render-generate (render -> tokenize -> generate -> derender "
+                  "on %s, derender batch: %d chunks); that address must expose these endpoints",
+                  config.CONTINUATION_URL, config.DERENDER_BATCH_CHUNKS)
     # handler_cancellation=True：aiohttp 的默认值是 False，默认值下客户端断连时
     # RequestHandler.connection_lost() 不会 cancel 正在处理这个请求的 task（读
     # aiohttp/web_protocol.py 源码确认，`_task_handler.cancel()` 那行套在
