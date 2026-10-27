@@ -144,6 +144,28 @@ def correct_usage(recovered: RecoveredTokens, final_leg_usage: dict, is_multimod
     return corrected
 
 
+def rewrite_chunk_fields(obj: dict, response_id: Optional[str], reasoning_field: Optional[str]) -> bool:
+    """续写腿的 chunk 原地改写两个字段，返回是否改动过：id 改回 leg1 的原始 response_id，
+    delta 里的思考字段名改成 leg1 用的那个。rewrite_leg2_line()（chat-continue 续写腿逐行
+    转发）和 render_generate.py（derender 出来的 chunk）共用这一份。"""
+    changed = False
+    if response_id and obj.get("id") and obj["id"] != response_id:
+        obj["id"] = response_id
+        changed = True
+    if reasoning_field:
+        other = next(n for n in REASONING_FIELDS if n != reasoning_field)
+        for ch in obj.get("choices") or []:
+            delta = ch.get("delta")
+            if isinstance(delta, dict) and other in delta:
+                value = delta.pop(other)
+                # 目标字段已经存在且有内容时不覆盖（同一个 delta 里不会同时出现两个名字，
+                # 这只是防御，避免丢内容）。
+                if not delta.get(reasoning_field):
+                    delta[reasoning_field] = value
+                changed = True
+    return changed
+
+
 def rewrite_leg2_line(line: bytes, recovered: RecoveredTokens, response_id: Optional[str],
                        is_multimodal: bool = False, reasoning_field: Optional[str] = None,
                        engine: str = "sglang") -> bytes:
@@ -171,21 +193,7 @@ def rewrite_leg2_line(line: bytes, recovered: RecoveredTokens, response_id: Opti
         obj = json.loads(data)
     except json.JSONDecodeError:
         return line
-    changed = False
-    if response_id and obj.get("id") and obj["id"] != response_id:
-        obj["id"] = response_id
-        changed = True
-    if reasoning_field:
-        other = next(n for n in REASONING_FIELDS if n != reasoning_field)
-        for ch in obj.get("choices") or []:
-            delta = ch.get("delta")
-            if isinstance(delta, dict) and other in delta:
-                value = delta.pop(other)
-                # 目标字段已经存在且有内容时不覆盖（同一个 delta 里不会同时出现两个名字，
-                # 这只是防御，避免丢内容）。
-                if not delta.get(reasoning_field):
-                    delta[reasoning_field] = value
-                changed = True
+    changed = rewrite_chunk_fields(obj, response_id, reasoning_field)
     if obj.get("usage"):
         obj["usage"] = correct_usage(recovered, obj["usage"], is_multimodal, engine)
         changed = True

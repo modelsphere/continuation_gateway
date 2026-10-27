@@ -15,6 +15,11 @@ _build_prefix_think_tag（<think>...</think> 格式）：这是目前已知模�
 字符串前缀被引擎以 400 拒绝，这类组合在 content-done 时改发 reasoning / content 分开的结构化
 消息，见 _STRUCTURED_CONTENT_DONE 和 build_assistant_message()。
 
+还有一类组合不走 chat-continue：渲染器不认 continue_final_message 的「引擎 + 模型」（目前只有
+vLLM + Kimi-K3），续写腿改成 render → tokenize → generate → derender 四步，见 uses_render_generate()
+和 render_generate.py；这条路径的前缀不带开头标签（render 出来的 prompt 已经打开了思考通道），
+见 build_k3_render_prefix()。
+
 当前只覆盖自由文本、且崩溃时还没出现过 tool_call chunk 的情况，所以运行时只需要判断
 content 是否非空：非空说明 thinking 阶段已经结束（content-done），为空则保守按"可能还在
 thinking"处理（thinking-partial）——这条对所有 builder 都成立，不是 K3 专属。tool_call
@@ -62,11 +67,11 @@ _BUILDERS = {
 
 # 已验证过的「引擎 -> 模型型号」组合（README 兼容表里的模型名）。只用于启动时判断
 # CONTINUATION_MODEL 在当前 CONTINUATION_ENGINE 上有没有验证过，不参与任何分发；没有专门
-# builder 的型号（如 glm-5.3）走默认 <think> 格式，也在这里登记。Kimi-K3 在 vLLM 上不支持，
-# 所以不在 vllm 一栏。
+# builder 的型号（如 glm-5.3）走默认 <think> 格式，也在这里登记。vLLM 上的 Kimi-K3 走
+# render-generate 路径（见 uses_render_generate()），要求 vLLM 开启 --enable-scale-out。
 VERIFIED_MODELS = {
     "sglang": ("kimi-k3", "qwen3.6-35b-a3b", "glm-5.3"),
-    "vllm": ("qwen3.6-35b-a3b", "glm-5.3", "deepseek-v4-flash-0731-nvfp4"),
+    "vllm": ("qwen3.6-35b-a3b", "glm-5.3", "deepseek-v4-flash-0731-nvfp4", "kimi-k3"),
 }
 
 # 关思考开关在 chat_template_kwargs 里的 key：默认 `thinking`，Qwen3 系的模板读的是
@@ -95,6 +100,16 @@ def match_key(model: str, keys) -> str:
         if _normalize(key) == name:
             return key
     return None
+
+
+# 引擎 -> 该引擎上续写腿走 render-generate 的模型型号。
+_RENDER_GENERATE = {
+    "vllm": ("kimi-k3",),
+}
+
+
+def uses_render_generate(engine: str, model: str) -> bool:
+    return bool(match_key(model, _RENDER_GENERATE.get(engine, ())))
 
 
 def build_prefix(model: str, reasoning: str, content: str) -> str:
@@ -131,6 +146,30 @@ def thinking_disable_kwargs(model: str, content: str) -> dict:
         return {}
     key = _THINKING_SWITCH_KEYS.get(match_key(model, _THINKING_SWITCH_KEYS), _DEFAULT_THINKING_SWITCH_KEY)
     return {key: False}
+
+
+def build_k3_render_prefix(reasoning: str, content: str, thinking_open: bool) -> str:
+    """render-generate 路径的 Kimi-K3 前缀：接在 render 出来的 prompt 后面、模型接着 generation
+    prompt 会写出来的原始文本。和 _build_prefix_kimi_k3 不同，这里不写开头的
+    `<|open|>think<|sep|>`，因为 prompt 末尾已经带了。
+
+    thinking_open 由 prompt 末尾的 token 决定（`<|open|>think<|sep|>` 为真，
+    `<|open|>response<|sep|>` 为假），不靠「reasoning 是否为空」推断：
+    - 思考通道开着：content 为空时就是裸的 reasoning（不闭合，让模型自己决定何时收尾）；
+      content 非空时 reasoning 后面接 think 的闭合和 response 的开头，再接 content。
+    - 思考通道已关（prompt 末尾直接是 response 的开头）：只有 content，不能再写任何标签；
+      此时不该有 reasoning，有就说明 prompt 和 leg1 的实际输出对不上，抛 ValueError。
+    """
+    if not thinking_open:
+        if reasoning:
+            raise ValueError("prompt closes the thinking channel but leg1 produced reasoning")
+        return content
+    if content:
+        return (
+            f"{reasoning}{XTML_CLOSE}think{XTML_SEP}"
+            f"{XTML_OPEN}response{XTML_SEP}{content}"
+        )
+    return reasoning
 
 
 def classify_case(tool_calls_seen: bool, reasoning: str, content: str) -> str:

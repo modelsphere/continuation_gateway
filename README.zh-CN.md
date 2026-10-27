@@ -21,7 +21,7 @@
 > | Qwen3.6-35B-A3B | ✅ 已验证 | |
 > | GLM-5.3 | ✅ 已验证 | |
 > | DeepSeek-V4-Flash-0731-nvfp4 | ✅ 已验证 | |
-> | Kimi-K3 | ❌ 不支持 | |
+> | Kimi-K3 | ✅ 已验证 | vLLM 必须开启 `--enable-scale-out`，否则续写无效；不支持多模态请求的续写 |
 >
 > 表中的模型名就是 `CONTINUATION_MODEL` 应设置的字符串（大小写不敏感，精确匹配）。表中模型
 > 的量化或微调版本，例如 `GLM-5.3-FP8`，应直接设置为表里的名字 `GLM-5.3`；不同的尺寸或版本
@@ -148,6 +148,12 @@ DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODEL=<真实模型名>
 发第二条腿，用于验证监测链路本身、不给下游增加真实续写负载）、`STALL_IDLE_TIMEOUT_SECONDS`、
 `CONNECT_TIMEOUT_SECONDS`、`MAX_CONTINUATION_BODY_MB`、`MAX_REQUEST_BODY_MB`、
 `CJK_CHARS_PER_TOKEN`、`OTHER_CHARS_PER_TOKEN`。
+
+`DERENDER_BATCH_CHUNKS`（默认 `8`，最小 `1`）只对续写腿走 render-generate 的组合（vLLM + Kimi-K3）
+生效：这条腿依次对 `CONTINUATION_URL` 调用 render、tokenize、`/inference/v1/generate` 和
+derender，所以该地址必须同时暴露这四个端点（vLLM 服务端需要 `--enable-scale-out`）。derender
+每次调用都会重放此前生成的全部 token，因此生成的 chunk 要攒批，每 `DERENDER_BATCH_CHUNKS` 个调一次，
+剩余部分在带 `finish_reason` 的结束 chunk 到达时一次送出。值越大 derender 调用越少，但输出越成块。
 
 `BUFFER_TOOL_CALLS`（默认 `false`，关闭时行为不变；只在 `CONTINUATION_ENABLED=true` 时才会
 真的生效，见下）：leg1 上出现带 `tool_calls` 的 chunk 后，这一个 chunk 和之后的所有行都暂存在

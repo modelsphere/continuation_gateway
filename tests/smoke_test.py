@@ -20,6 +20,7 @@ usage/max_tokens 扣减用到的 token 数不是靠 /v1/tokenize 现测的（这
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 
@@ -314,6 +315,13 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
                 "prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13}}))
             await resp.write(b"data: [DONE]\n\n")
 
+    elif scenario in K3_RENDER_SCENARIOS:
+        # render-generate 续写腿的第一条腿：吐完配置里的 delta 然后卡住，触发续写。
+        assert call_n == 1, "续写腿不该再打 /v1/chat/completions"
+        for delta in K3_RENDER_SCENARIOS[scenario]["leg1"]:
+            await resp.write(sse({"id": "chatcmpl-leg1", "choices": [{"delta": delta}]}))
+        await asyncio.sleep(5)
+
     elif scenario == "vllm_multimodal_passthrough":
         # engine=vllm 时多模态请求不进续写：下游卡住也不该被网关掐断去续写。
         await resp.write(sse({"choices": [{"delta": {"content": "image reply, untouched."}}]}))
@@ -512,9 +520,147 @@ async def continuation_downstream_chat(request: web.Request) -> web.StreamRespon
     return resp
 
 
+
+# ---- vLLM + Kimi-K3 的 render-generate 续写腿：假的 render / tokenize / generate / derender ----------
+# 假 tokenizer：三个控制符各一个 token，think / response 紧跟在控制符后面时各一个 token，其余
+# 每个字符一个 token（10000 + ord）。
+K3_OPEN, K3_CLOSE, K3_SEP, K3_THINK, K3_RESPONSE = 1000, 1001, 1002, 1003, 1004
+_K3_TOKEN_TABLE = {"<|open|>": K3_OPEN, "<|close|>": K3_CLOSE, "<|sep|>": K3_SEP,
+                   "think": K3_THINK, "response": K3_RESPONSE}
+_K3_TOKEN_RE = re.compile(r"<\|open\|>|<\|close\|>|<\|sep\|>|(?<=>)think|(?<=>)response|.", re.S)
+
+
+def k3_tokenize(text: str) -> list:
+    return [_K3_TOKEN_TABLE[m] if m in _K3_TOKEN_TABLE else 10000 + ord(m)
+            for m in _K3_TOKEN_RE.findall(text)]
+
+
+def ch(c: str) -> int:
+    return 10000 + ord(c)
+
+
+# 每个场景：leg1 先吐 leg1 里的 delta 然后卡住；render 出的 prompt 末尾是 tail；generate 依次吐 gen
+# 里的 chunk（(token_ids, finish_reason)），最后带 usage。
+K3_RENDER_SCENARIOS = {
+    "k3_render_thinking_partial": {
+        "leg1": [{"reasoning_content": "step one. "}],
+        "tail": [K3_OPEN, K3_THINK, K3_SEP],
+        "gen": [([ch("x")], None), ([K3_CLOSE], None), ([K3_THINK], None), ([K3_SEP], None),
+                ([K3_OPEN], None), ([K3_RESPONSE], None), ([K3_SEP], None), ([ch("y")], None),
+                ([ch("z")], "stop")],
+        "gen_completion_tokens": 9,
+    },
+    "k3_render_content_done": {
+        "leg1": [{"reasoning_content": "think. "}, {"content": "ans"}],
+        "tail": [K3_OPEN, K3_THINK, K3_SEP],
+        "gen": [([ch("y")], "stop")],
+        "gen_completion_tokens": 1,
+    },
+    "k3_render_thinking_closed": {
+        "leg1": [{"content": "abc"}],
+        "tail": [K3_OPEN, K3_RESPONSE, K3_SEP],
+        "gen": [([ch("y")], "stop")],
+        "gen_completion_tokens": 1,
+    },
+    "k3_render_budget_exhausted": {
+        "leg1": [{"reasoning_content": "step one. "}],
+        "tail": [K3_OPEN, K3_THINK, K3_SEP],
+        "gen": [([ch("y")], "stop")],
+        "gen_completion_tokens": 1,
+    },
+    "k3_render_http_error": {
+        "leg1": [{"content": "partial"}],
+        "tail": [K3_OPEN, K3_THINK, K3_SEP],
+        "render_status": 400,
+        "gen": [],
+        "gen_completion_tokens": 0,
+    },
+    "k3_render_bad_tail": {
+        "leg1": [{"content": "partial"}],
+        "tail": [1, 2, 3],
+        "gen": [],
+        "gen_completion_tokens": 0,
+    },
+}
+k3_record = {}  # scenario -> {"render": body, "tokenize": [...], "generate": body, "derender": [body, ...]}
+
+
+def k3_scenario_record() -> dict:
+    return {"render": None, "tokenize": [], "generate": None, "derender": []}
+
+
+async def k3_render(request: web.Request) -> web.Response:
+    scenario = request.headers.get("X-Test-Scenario", "default")
+    cfg = K3_RENDER_SCENARIOS[scenario]
+    body = await request.json()
+    k3_record.setdefault(scenario, k3_scenario_record())["render"] = body
+    if cfg.get("render_status"):
+        return web.Response(status=cfg["render_status"], text="render rejected")
+    return web.json_response({
+        "token_ids": k3_tokenize("hi") + cfg["tail"],
+        "sampling_params": {"max_tokens": body.get("max_tokens"), "temperature": body.get("temperature")},
+        "model": body.get("model"),
+    })
+
+
+async def k3_tokenize_handler(request: web.Request) -> web.Response:
+    scenario = request.headers.get("X-Test-Scenario", "default")
+    body = await request.json()
+    k3_record.setdefault(scenario, k3_scenario_record())["tokenize"].append(body)
+    return web.json_response({"tokens": k3_tokenize(body["prompt"])})
+
+
+async def k3_generate(request: web.Request) -> web.StreamResponse:
+    scenario = request.headers.get("X-Test-Scenario", "default")
+    cfg = K3_RENDER_SCENARIOS[scenario]
+    body = await request.json()
+    k3_record.setdefault(scenario, k3_scenario_record())["generate"] = body
+    resp = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+    await resp.prepare(request)
+    for token_ids, finish_reason in cfg["gen"]:
+        await resp.write(sse({"request_id": "gen-1", "choices": [
+            {"index": 0, "token_ids": token_ids, "finish_reason": finish_reason}]}))
+    await resp.write(sse({"request_id": "gen-1", "choices": [], "usage": {
+        "prompt_tokens": len(body["token_ids"]), "completion_tokens": cfg["gen_completion_tokens"],
+        "total_tokens": len(body["token_ids"]) + cfg["gen_completion_tokens"]}}))
+    await resp.write(b"data: [DONE]\n\n")
+    await resp.write_eof()
+    return resp
+
+
+async def k3_derender(request: web.Request) -> web.Response:
+    """按调用序号返回固定的 delta：第 1 次只有 reasoning；第 2 次 reasoning 和 content 同批；
+    结束那次 content 和两个 tool_call 同批——用来验证网关把合并的 delta 按序拆开。"""
+    scenario = request.headers.get("X-Test-Scenario", "default")
+    body = await request.json()
+    record = k3_record.setdefault(scenario, k3_scenario_record())
+    record["derender"].append(body)
+    n = len(record["derender"])
+    finish_reason = body["generate_chunk"]["choices"][0]["finish_reason"]
+    delta = {"reasoning": f"R{n}"}
+    if n == 1:
+        delta["role"] = "assistant"
+    if n >= 2:
+        delta["content"] = f"C{n}"
+    if finish_reason:
+        delta.pop("reasoning")
+        delta["tool_calls"] = [
+            {"index": 0, "id": "call-0", "type": "function", "function": {"name": "f0", "arguments": "{}"}},
+            {"index": 1, "id": "call-1", "type": "function", "function": {"name": "f1", "arguments": "{}"}},
+        ]
+    chunk = {"id": "derender-own-id", "object": "chat.completion.chunk", "created": 1, "model": "m",
+             "choices": [{"index": 0, "delta": delta,
+                          "finish_reason": "tool_calls" if finish_reason else None}]}
+    return web.json_response({"chunk": chunk, "stream_state": {"n": n}})
+
+
 async def run_downstream():
     app = web.Application(client_max_size=gw_config.MAX_REQUEST_BODY_BYTES)
     app.router.add_post("/v1/chat/completions", downstream_chat)
+    app.router.add_post("/v1/chat/completions/render", k3_render)
+    app.router.add_post("/tokenize", k3_tokenize_handler)
+    app.router.add_post("/inference/v1/generate", k3_generate)
+    app.router.add_post("/v1/chat/completions/derender", k3_derender)
     # handler_cancellation=True：跟 run_gateway() 一样的原因（见那边注释）。这个假 downstream
     # 自己不需要靠这个感知谁断了它，但 upstream_disconnect_before_first_chunk 那个场景要靠
     # "网关断开自己到这个假 downstream 的连接后，这里的 sleep 被 CancelledError 打断"来
@@ -612,6 +758,42 @@ async def call_gateway(scenario: str, model: str = SERVED_MODEL_NAME, extra: dic
             "finish_reason": finish_reason, "usage": usage, "aborted": aborted, "ids": ids,
             "tool_call_args": "".join(tool_call_args), "first_tool_call_at": first_tool_call_at,
             "finish_at": finish_at, "reasoning_fields": reasoning_fields}
+
+
+async def call_gateway_chunks(scenario: str, extra: dict = None):
+    """和 call_gateway 一样发请求，但按到达顺序返回每个解析后的 chunk（不合并），用来检查拆分顺序。"""
+    payload = {"model": SERVED_MODEL_NAME, "stream": True, "max_tokens": 1000, "temperature": 0.7,
+               "messages": [{"role": "user", "content": "hi"}]}
+    payload.update(extra or {})
+    chunks, saw_done = [], False
+    async with ClientSession(timeout=ClientTimeout(total=15)) as client:
+        async with client.post(f"http://127.0.0.1:{GATEWAY_PORT}/v1/chat/completions",
+                                json=payload, headers={"X-Test-Scenario": scenario}) as resp:
+            async for raw_line in resp.content:
+                line = raw_line.decode().strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    saw_done = True
+                    break
+                chunks.append(json.loads(data))
+    return chunks, saw_done
+
+
+def chunk_kind(obj: dict) -> str:
+    """一个 chunk 里出现了哪几种内容；流式 chunk 一次只该有一种。"""
+    if not obj.get("choices"):
+        return "usage" if obj.get("usage") else "empty"
+    delta = obj["choices"][0].get("delta") or {}
+    kinds = []
+    if delta.get("reasoning") or delta.get("reasoning_content"):
+        kinds.append("reasoning")
+    if delta.get("content"):
+        kinds.append("content")
+    if delta.get("tool_calls"):
+        kinds.append("tool_calls")
+    return "+".join(kinds) if kinds else "empty"
 
 
 async def main():
@@ -810,8 +992,175 @@ async def main():
               match_key("DeepSeek-V4-Flash-0731-NVFP4", vl) == "deepseek-v4-flash-0731-nvfp4"
               and match_key("deepseek-v4-flash-0731", vl) is None
               and match_key("deepseek-v4-flash-0731-nvfp4", sg) is None)
-        check("VERIFIED_MODELS: Kimi-K3 verified on sglang only",
-              match_key("kimi-k3", sg) == "kimi-k3" and match_key("kimi-k3", vl) is None)
+        check("VERIFIED_MODELS: Kimi-K3 verified on both engines (vllm via render-generate)",
+              match_key("kimi-k3", sg) == "kimi-k3" and match_key("kimi-k3", vl) == "kimi-k3")
+
+        print("\n== render-generate 纯函数：plan_flush（聚合 + 标记尾部顺延）==")
+        from continuation_gateway.render_generate import (
+            marker_tail_len, plan_flush, split_delta_chunk)
+        marker_ids = (K3_OPEN, K3_CLOSE, K3_SEP)
+        hold = lambda ids: marker_tail_len(ids, marker_ids)  # noqa: E731
+        stream = [ch("a"), ch("b"), K3_OPEN, K3_THINK, K3_SEP, ch("c"), K3_CLOSE, K3_THINK, K3_SEP,
+                  K3_OPEN, K3_RESPONSE, K3_SEP, ch("d"), ch("e")]
+        lossless, never_dangling = True, True
+        for chunk_size in (1, 2, 3):
+            chunks = [stream[i:i + chunk_size] for i in range(0, len(stream), chunk_size)]
+            for batch in (1, 2, 3, 5):
+                pending, buffered, count, sent = [], [], 0, []
+                for i, token_ids in enumerate(chunks):
+                    last = i == len(chunks) - 1
+                    buffered, count = buffered + token_ids, count + 1
+                    if last or count >= batch:
+                        to_send, pending = plan_flush(pending, buffered, last, hold)
+                        buffered, count = [], 0
+                        if not last and marker_tail_len(to_send, marker_ids):
+                            never_dangling = False
+                        sent.extend(to_send)
+                lossless = lossless and sent == stream and pending == []
+        check("every send sequence reassembles to the generated tokens exactly", lossless)
+        check("no non-final send ends with a control marker + name (every chunking, batch 1/2/3/5)",
+              never_dangling)
+        check("plan_flush with a no-op hold sends everything",
+              plan_flush([], [K3_OPEN, K3_THINK], False, lambda ids: 0) == ([K3_OPEN, K3_THINK], []))
+        check("plan_flush holds the control marker + name tail",
+              plan_flush([], [ch("a"), K3_OPEN, K3_THINK], False, hold)
+              == ([ch("a")], [K3_OPEN, K3_THINK]))
+        check("plan_flush sends the held tail with the final chunk",
+              plan_flush([K3_OPEN, K3_THINK], [K3_SEP], True, hold) == ([K3_OPEN, K3_THINK, K3_SEP], []))
+        check("a lone trailing control marker is not held",
+              plan_flush([], [ch("a"), K3_CLOSE], False, hold) == ([ch("a"), K3_CLOSE], []))
+
+        print("\n== render-generate 纯函数：split_delta_chunk（按序拆分）==")
+        merged = {"id": "x", "object": "chat.completion.chunk", "model": "m", "choices": [{
+            "index": 0, "finish_reason": "tool_calls",
+            "delta": {"role": "assistant", "reasoning": "R", "content": "C", "tool_calls": [
+                {"index": 0, "id": "a"}, {"index": 1, "id": "b"}]}}]}
+        pieces = split_delta_chunk(merged)
+        check("merged delta splits into reasoning, content, then one chunk per tool_call",
+              [chunk_kind(p) for p in pieces] == ["reasoning", "content", "tool_calls", "tool_calls"],
+              [chunk_kind(p) for p in pieces])
+        check("role stays on the first piece only",
+              pieces[0]["choices"][0]["delta"].get("role") == "assistant"
+              and all("role" not in p["choices"][0]["delta"] for p in pieces[1:]))
+        check("finish_reason only on the last piece",
+              [p["choices"][0]["finish_reason"] for p in pieces] == [None, None, None, "tool_calls"])
+        check("tool_call entries keep their order",
+              [p["choices"][0]["delta"]["tool_calls"][0]["id"] for p in pieces[2:]] == ["a", "b"])
+        check("every piece keeps id/model", all(p["id"] == "x" and p["model"] == "m" for p in pieces))
+        single = {"id": "x", "choices": [{"index": 0, "delta": {"content": "C"}, "finish_reason": None}]}
+        check("single-part chunk is returned unchanged", split_delta_chunk(single) == [single])
+        finish_only = {"id": "x", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        check("finish-only chunk is returned unchanged", split_delta_chunk(finish_only) == [finish_only])
+        usage_only = {"id": "x", "choices": [], "usage": {"prompt_tokens": 1}}
+        check("usage-only chunk is returned unchanged", split_delta_chunk(usage_only) == [usage_only])
+
+        print("\n== render-generate 续写腿（vllm + kimi-k3）==")
+        original = (gw_config.CONTINUATION_ENGINE, gw_config.CONTINUATION_MODEL, gw_config.DERENDER_BATCH_CHUNKS)
+        gw_config.CONTINUATION_ENGINE, gw_config.CONTINUATION_MODEL = "vllm", "kimi-k3"
+        gw_config.DERENDER_BATCH_CHUNKS = 3
+        try:
+            k3_runs = {}
+            for name in ("k3_render_thinking_partial", "k3_render_content_done", "k3_render_thinking_closed"):
+                # content-done 是 chat-continue 路径会追加关思考开关的场景：客户端带着 kwargs 发请求，
+                # 用来确认 render-generate 路径不会改它们。
+                extra = {"chat_template_kwargs": {"thinking": True, "foo": 1}} if name == "k3_render_content_done" else None
+                k3_runs[name] = await call_gateway_chunks(name, extra=extra)
+            k3_runs["k3_render_budget_exhausted"] = await call_gateway_chunks(
+                "k3_render_budget_exhausted", extra={"max_tokens": est("step one. ")})
+            k3_runs["k3_render_http_error"] = await call_gateway_chunks("k3_render_http_error")
+            k3_runs["k3_render_bad_tail"] = await call_gateway_chunks("k3_render_bad_tail")
+        finally:
+            gw_config.CONTINUATION_ENGINE, gw_config.CONTINUATION_MODEL, gw_config.DERENDER_BATCH_CHUNKS = original
+
+        # thinking-partial：批大小 3、一个 token 一个 chunk，两个批尾都落在「控制符 + 名字」上
+        chunks, saw_done = k3_runs["k3_render_thinking_partial"]
+        rec = k3_record["k3_render_thinking_partial"]
+        head = k3_tokenize("hi") + [K3_OPEN, K3_THINK, K3_SEP]
+        prefix_ids = k3_tokenize("step one. ")
+        check("render got the original request without stream fields",
+              rec["render"]["messages"] == [{"role": "user", "content": "hi"}]
+              and "stream" not in rec["render"] and "stream_options" not in rec["render"], rec["render"])
+        check("generate token_ids = rendered prompt + tokenized prefix (no opening tag)",
+              rec["generate"]["token_ids"] == head + prefix_ids)
+        check("generate max_tokens = client budget minus the estimated recovered tokens (same as chat-continue)",
+              rec["generate"]["sampling_params"]["max_tokens"] == 1000 - est("step one. "),
+              rec["generate"]["sampling_params"])
+        check("first use tokenizes the two control-marker strings once, plus the prefix (3 calls)",
+              [t["prompt"] for t in rec["tokenize"]]
+              == ["<|open|><|close|><|sep|>", "<|open|>think<|sep|><|open|>response<|sep|>", "step one. "]
+              and all(t["add_special_tokens"] is False for t in rec["tokenize"]), rec["tokenize"])
+        sent = [d["generate_chunk"]["choices"][0]["token_ids"] for d in rec["derender"]]
+        check("derender calls: batches of 3 chunks, marker tails carried to the next call",
+              sent == [[ch("x")], [K3_CLOSE, K3_THINK, K3_SEP], [K3_OPEN, K3_RESPONSE, K3_SEP, ch("y"), ch("z")]],
+              sent)
+        check("only the last derender call carries finish_reason",
+              [d["generate_chunk"]["choices"][0]["finish_reason"] for d in rec["derender"]]
+              == [None, None, "stop"])
+        check("derender always gets the full prompt ids and the carried stream_state",
+              all(d["prompt_token_ids"] == head + prefix_ids and d["prompt_tokens"] == len(head + prefix_ids)
+                  for d in rec["derender"])
+              and [d["stream_state"] for d in rec["derender"]] == [None, {"n": 1}, {"n": 2}])
+        leg2_kinds = [chunk_kind(c) for c in chunks[1:]]
+        check("client sees one kind of content per chunk, in order",
+              leg2_kinds == ["reasoning", "reasoning", "content", "content", "tool_calls", "tool_calls", "usage"],
+              leg2_kinds)
+        finishes = [c["choices"][0]["finish_reason"] for c in chunks[1:] if c.get("choices")]
+        check("finish_reason only on the last content chunk", finishes == [None] * 5 + ["tool_calls"], finishes)
+        check("ids are rewritten back to leg1's id and reasoning uses leg1's field name",
+              all(c["id"] == "chatcmpl-leg1" for c in chunks)
+              and all("reasoning" not in (c.get("choices") or [{}])[0].get("delta", {}) for c in chunks))
+        usage = chunks[-1]["usage"]
+        prompt_est, completion_est = est("hi"), 9 + est("step one. ")
+        check("usage: same correction as chat-continue; leg2 reasoning is estimated from the reasoning "
+              "text derender returned (the engine reports none), leg1's from the recovered text",
+              usage == {"prompt_tokens": prompt_est, "completion_tokens": completion_est,
+                        "total_tokens": prompt_est + completion_est,
+                        "completion_tokens_details": {"reasoning_tokens": est("R1R2") + est("step one. ")}}, usage)
+        check("stream ends with [DONE]", saw_done)
+
+        # content-done：reasoning 全文 + think 的闭合 + response 的开头 + content
+        chunks, _ = k3_runs["k3_render_content_done"]
+        rec = k3_record["k3_render_content_done"]
+        head = k3_tokenize("hi") + [K3_OPEN, K3_THINK, K3_SEP]
+        prefix_ids = (k3_tokenize("think. ") + [K3_CLOSE, K3_THINK, K3_SEP, K3_OPEN, K3_RESPONSE, K3_SEP]
+                      + k3_tokenize("ans"))
+        check("content-done prefix closes think and opens response before the content",
+              rec["generate"]["token_ids"] == head + prefix_ids)
+        usage = chunks[-1]["usage"]
+        check("content-done usage: recovered reasoning/content estimated, no reasoning in the continuation",
+              usage["completion_tokens"] == 1 + est("think. ") + est("ans")
+              and usage["completion_tokens_details"]["reasoning_tokens"] == est("think. "), usage)
+        check("later requests reuse the cached marker ids: only the prefix is tokenized",
+              len(rec["tokenize"]) == 1, rec["tokenize"])
+        check("render request carries the client's chat_template_kwargs untouched (no thinking switch added)",
+              rec["render"].get("chat_template_kwargs") == {"thinking": True, "foo": 1}
+              and "stream" not in rec["render"], rec["render"])
+        check("generate request has no chat_template_kwargs (it takes token ids only)",
+              "chat_template_kwargs" not in rec["generate"], list(rec["generate"]))
+
+        # 思考通道在 prompt 里已经关闭：前缀只有 content
+        chunks, _ = k3_runs["k3_render_thinking_closed"]
+        rec = k3_record["k3_render_thinking_closed"]
+        head = k3_tokenize("hi") + [K3_OPEN, K3_RESPONSE, K3_SEP]
+        check("thinking closed in the prompt: prefix is the bare content",
+              rec["generate"]["token_ids"] == head + k3_tokenize("abc")
+              and rec["generate"]["sampling_params"]["max_tokens"] == 1000 - est("abc"),
+              rec["generate"]["sampling_params"])
+        check("thinking closed in the prompt: no reasoning tokens",
+              chunks[-1]["usage"]["completion_tokens_details"]["reasoning_tokens"] == 0, chunks[-1]["usage"])
+
+        # 预算用完：不发 generate
+        chunks, _ = k3_runs["k3_render_budget_exhausted"]
+        check("budget exhausted: nothing is sent downstream, client keeps leg1's partial output",
+              "k3_render_budget_exhausted" not in k3_record
+              and not any(c.get("choices") and c["choices"][0].get("finish_reason") for c in chunks))
+
+        # 失败：只留 leg1 已经发出的内容，不崩
+        for name in ("k3_render_http_error", "k3_render_bad_tail"):
+            chunks, _ = k3_runs[name]
+            check(f"{name}: leg2 fails cleanly, client keeps leg1's partial output",
+                  [chunk_kind(c) for c in chunks] == ["content"] and k3_record[name]["generate"] is None,
+                  [chunk_kind(c) for c in chunks])
 
         print("\n== vllm_multimodal_passthrough (CONTINUATION_ENGINE=vllm 时多模态请求不进续写) ==")
         original_engine = gw_config.CONTINUATION_ENGINE
