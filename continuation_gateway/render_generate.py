@@ -260,6 +260,7 @@ class _DerenderRelay:
         self.buffered_chunks = 0
         self.stream_state = None
         self.finished = False
+        self.derender_calls = 0
         self.last_chunk = {}
         self.reasoning_text = []  # 写给客户端的 reasoning 文本，用来估算续写段的 reasoning_tokens
 
@@ -288,6 +289,7 @@ class _DerenderRelay:
             "prompt_token_ids": self.prompt_ids,
             "chat_request": self.chat_request,
         }, "derender")
+        self.derender_calls += 1
         chunk = out.get("chunk")
         if not isinstance(chunk, dict) or "stream_state" not in out:
             raise RenderGenerateError("leg2_render_bad_response", "step=derender: no chunk/stream_state")
@@ -318,7 +320,7 @@ class _DerenderRelay:
 
 async def run_render_generate(session: ClientSession, headers: dict, original_payload: dict,
                               state: StreamState, out: web.StreamResponse, recovered,
-                              remaining_budget: Optional[int]) -> tuple:
+                              remaining_budget: Optional[int], log_id: str = "") -> tuple:
     """发起并转发整条续写腿，返回 (outcome, finished)，含义和 server.relay_leg2() 一致：outcome
     是这条腿结束的原因（给日志用），finished 是结束前有没有送出过 finish_reason。某一步失败抛
     RenderGenerateError，由调用方记日志。recovered 是被救回部分的估算 token 数（usage 修正用），
@@ -352,6 +354,10 @@ async def run_render_generate(session: ClientSession, headers: dict, original_pa
         sampling_params["max_tokens"] = remaining_budget
     elif isinstance(sampling_params.get("max_tokens"), int):
         sampling_params["max_tokens"] = max(1, sampling_params["max_tokens"] - len(prefix_ids))
+
+    log.info("[continuation req=%s] render-generate: thinking_open=%s prompt_tokens=%d prefix_tokens=%d "
+             "max_tokens=%s", log_id, thinking_open, len(prompt_head), len(prefix_ids),
+             sampling_params.get("max_tokens"))
 
     generate_body = dict(rendered)
     generate_body.pop("token_offsets", None)  # 按原 prompt 算的偏移，接上前缀后已不对应
@@ -410,6 +416,9 @@ async def run_render_generate(session: ClientSession, headers: dict, original_pa
     except (ClientError, asyncio.TimeoutError) as e:
         raise RenderGenerateError("leg2_connect_error", f"step=generate: {e}")
 
+    log.info("[continuation req=%s] render-generate: generated_tokens=%d derender_calls=%d "
+             "(batch=%d chunks) finished=%s", log_id, len(generated_ids), relay.derender_calls,
+             config.DERENDER_BATCH_CHUNKS, relay.finished)
     if not relay.finished:
         return end_reason, False
 

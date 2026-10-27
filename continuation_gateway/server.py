@@ -401,7 +401,7 @@ async def attempt_render_generate(session: ClientSession, headers: dict, origina
     工具不用区分。"""
     try:
         leg2_outcome, leg2_finished = await run_render_generate(
-            session, headers, original_payload, state, out, recovered, remaining_budget)
+            session, headers, original_payload, state, out, recovered, remaining_budget, log_id)
     except RenderGenerateError as e:
         log.warning("[continuation req=%s] FAILED reason=%s case=%s %s", log_id, e.reason, case, e.detail)
         return
