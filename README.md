@@ -7,7 +7,7 @@ English | [简体中文](README.zh-CN.md)
 > `CONTINUATION_ENGINE`. Within this project, each engine + model combination has its own
 > continuation strategy. The combinations verified so far:
 >
-> **SGLang**
+> **SGLang(tested on v0.5.19+)**
 >
 > | Model | Status | Notes |
 > | --- | --- | --- |
@@ -15,7 +15,7 @@ English | [简体中文](README.zh-CN.md)
 > | Qwen3.6-35B-A3B | ✅ Verified | |
 > | GLM-5.3 | ✅ Verified | |
 >
-> **vLLM**
+> **vLLM(tested on v0.30.0+)**
 >
 > | Model | Status | Notes |
 > | --- | --- | --- |
