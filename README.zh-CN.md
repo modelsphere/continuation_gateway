@@ -6,7 +6,9 @@
 > 网关支持 **SGLang** 和 **vLLM** 两种推理引擎，通过 `CONTINUATION_ENGINE` 指定。本项目针对
 > 不同的「引擎 + 模型」组合各有对应的续写策略，目前已验证的组合如下：
 >
-> **SGLang(在v0.5.19+版本上验证)**
+> 状态：✅ 已验证，❌ 不支持。
+>
+> **SGLang（NVIDIA GPU，在 v0.5.19+ 版本上验证）**
 >
 > | 模型 | 状态 | 备注 |
 > | --- | --- | --- |
@@ -14,7 +16,7 @@
 > | Qwen3.6-35B-A3B | ✅ 已验证 | |
 > | GLM-5.3 | ✅ 已验证 | |
 >
-> **vLLM(在v0.30.0+版本上验证)**
+> **vLLM（NVIDIA GPU，在 v0.30.0+ 版本上验证）**
 >
 > | 模型 | 状态 | 备注 |
 > | --- | --- | --- |
@@ -23,9 +25,22 @@
 > | DeepSeek-V4-Flash-0731-nvfp4 | ✅ 已验证 | |
 > | Kimi-K3 | ✅ 已验证 | vLLM 必须开启 `--enable-scale-out`，否则续写无效；不支持多模态请求的续写 |
 >
+> **vLLM（昇腾 910B4，在 vllm-ascend 0.30.0+ 版本上验证）**
+>
+> | 模型 | 状态 | 备注 |
+> | --- | --- | --- |
+> | Qwen3.6-35B-A3B | ✅ 已验证 | 使用 W8A8 权重测试 |
+> | Qwen3.6-27B | ✅ 已验证 | 使用 W8A8 权重测试 |
+> | Qwen3-30B-A3B | ✅ 已验证 | 使用 W8A8 权重测试 |
+> | Qwen3-14B | ✅ 已验证 | |
+> | Qwen3-8B | ✅ 已验证 | |
+> | Gemma-4-31B-it | ✅ 已验证 | 模型自身偶发不稳定：可能把控制 token 当作普通文本输出到 `content`（例如 `</think>`、`<\|tool_call>`），导致 tool_call 没有被解析出来而丢失。这来自模型及其解析器，不是续写前缀的构造问题 |
+> | Gemma-4-26B-A4B-it | ✅ 已验证 | 同 Gemma-4-31B-it；另外它的思考内容偶发会落进 `content` |
+> | Qwen3-Omni-30B-A3B-Instruct | ❌ 不支持 | |
+>
 > 表中的模型名就是 `CONTINUATION_MODEL` 应设置的字符串（大小写不敏感，精确匹配）。表中模型
 > 的量化或微调版本，例如 `GLM-5.3-FP8`，应直接设置为表里的名字 `GLM-5.3`；不同的尺寸或版本
-> （`Qwen3.6-27B`、`GLM-5.4`）是另一个模型，不会被匹配。
+> （`Qwen3-32B`、`GLM-5.4`）是另一个模型，不会被匹配。
 >
 > 其它模型和引擎尚未验证，可能可用，使用前请自行验证。我们仍在持续适配更多的引擎 + 模型组合。
 
@@ -40,9 +55,8 @@ LLM 推理服务的崩溃续写网关：位于客户端和 OpenAI 兼容的推�
 前缀拼接方式由 `CONTINUATION_MODEL`（本部署实际 serve 的真实模型，不看请求里的 `model`
 字段）决定（见 `continuation_gateway/reconstruct.py`），内置 Kimi-K3（XTML）和通用
 `<think>...</think>` 两种格式，接入其它格式的模型只需要在那里加一个 builder。没有匹配到已验证
-模型的，按通用格式处理，并在启动时打一条 warning。vLLM 上的 Qwen3.6-35B-A3B 在 content-done
-时额外把 partial 消息拆成 `reasoning` / `content` 两个字段发送，因为它的 chat template 会重排
-字符串形式，引擎随后以 400 拒绝。
+模型的，按通用格式处理，并在启动时打一条 warning。vLLM 上部分模型（如 Qwen3.6-35B-A3B）在
+content-done 时会额外把 partial 消息拆成 `reasoning` / `content` 两个字段发送。
 
 ```
                                   leg1：原始请求

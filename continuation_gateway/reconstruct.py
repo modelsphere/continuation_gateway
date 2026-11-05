@@ -71,7 +71,9 @@ _BUILDERS = {
 # render-generate 路径（见 uses_render_generate()），要求 vLLM 开启 --enable-scale-out。
 VERIFIED_MODELS = {
     "sglang": ("kimi-k3", "qwen3.6-35b-a3b", "glm-5.3"),
-    "vllm": ("qwen3.6-35b-a3b", "glm-5.3", "deepseek-v4-flash-0731-nvfp4", "kimi-k3"),
+    "vllm": ("qwen3.6-35b-a3b", "qwen3.6-27b", "qwen3-30b-a3b", "qwen3-14b", "qwen3-8b",
+             "gemma-4-31b-it", "gemma-4-26b-a4b-it", "glm-5.3", "deepseek-v4-flash-0731-nvfp4",
+             "kimi-k3"),
 }
 
 # 关思考开关在 chat_template_kwargs 里的 key：默认 `thinking`，Qwen3 系的模板读的是
@@ -81,11 +83,15 @@ VERIFIED_MODELS = {
 _DEFAULT_THINKING_SWITCH_KEY = "thinking"
 _THINKING_SWITCH_KEYS = {
     "qwen3.6-35b-a3b": "enable_thinking",
+    "qwen3.6-27b": "enable_thinking",
+    "qwen3-30b-a3b": "enable_thinking",
+    "qwen3-14b": "enable_thinking",
+    "qwen3-8b": "enable_thinking",
 }
 
-# 引擎 -> 该引擎上 content-done 需要发结构化消息的模型型号。
+# 引擎 -> 该引擎上 content-done 需要发结构化消息的模型型号。只登记测试出有问题确实需要的
 _STRUCTURED_CONTENT_DONE = {
-    "vllm": ("qwen3.6-35b-a3b",),
+    "vllm": ("qwen3.6-35b-a3b", "qwen3.6-27b", "qwen3-8b"),
 }
 
 

@@ -7,7 +7,9 @@ English | [简体中文](README.zh-CN.md)
 > `CONTINUATION_ENGINE`. Within this project, each engine + model combination has its own
 > continuation strategy. The combinations verified so far:
 >
-> **SGLang(tested on v0.5.19+)**
+> Status: ✅ verified, ❌ not supported.
+>
+> **SGLang (NVIDIA GPU, tested on v0.5.19+)**
 >
 > | Model | Status | Notes |
 > | --- | --- | --- |
@@ -15,7 +17,7 @@ English | [简体中文](README.zh-CN.md)
 > | Qwen3.6-35B-A3B | ✅ Verified | |
 > | GLM-5.3 | ✅ Verified | |
 >
-> **vLLM(tested on v0.30.0+)**
+> **vLLM (NVIDIA GPU, tested on v0.30.0+)**
 >
 > | Model | Status | Notes |
 > | --- | --- | --- |
@@ -24,10 +26,23 @@ English | [简体中文](README.zh-CN.md)
 > | DeepSeek-V4-Flash-0731-nvfp4 | ✅ Verified | |
 > | Kimi-K3 | ✅ Verified | vLLM must be started with `--enable-scale-out`, otherwise continuation does not work. Multimodal requests are not continued |
 >
+> **vLLM (Ascend 910B4, tested on vllm-ascend 0.30.0+)**
+>
+> | Model | Status | Notes |
+> | --- | --- | --- |
+> | Qwen3.6-35B-A3B | ✅ Verified | Tested with the W8A8 weights |
+> | Qwen3.6-27B | ✅ Verified | Tested with the W8A8 weights |
+> | Qwen3-30B-A3B | ✅ Verified | Tested with the W8A8 weights |
+> | Qwen3-14B | ✅ Verified | |
+> | Qwen3-8B | ✅ Verified | |
+> | Gemma-4-31B-it | ✅ Verified | The model itself is occasionally unstable: it may emit its control tokens as plain text in `content` (for example `</think>`, `<\|tool_call>`) so that the tool_call is not parsed and is lost. This comes from the model and its parser, not from how the continuation prefix is built |
+> | Gemma-4-26B-A4B-it | ✅ Verified | Same as Gemma-4-31B-it. Its reasoning may also occasionally end up in `content` |
+> | Qwen3-Omni-30B-A3B-Instruct | ❌ Not supported | |
+>
 > The model names in the tables are exactly the strings `CONTINUATION_MODEL` should be set to
 > (case-insensitive, exact match). A quantized or fine-tuned variant of a listed model, such as
 > `GLM-5.3-FP8`, should use the listed name `GLM-5.3`; a different size or version
-> (`Qwen3.6-27B`, `GLM-5.4`) is a different model and is not matched.
+> (`Qwen3-32B`, `GLM-5.4`) is a different model and is not matched.
 >
 > Other models and engines have not been verified; they may work, but please verify them
 > yourself before relying on them. We are continuing to adapt more engine + model
@@ -51,9 +66,8 @@ deployment actually serves; the `model` field of the request is not consulted), 
 `continuation_gateway/reconstruct.py`. Two formats are built in: Kimi-K3 (XTML) and a generic
 `<think>...</think>` format. Supporting a model with another format only takes adding a
 builder there. A model that matches no verified model is handled with the generic format, and
-the gateway logs a warning at startup. On vLLM, Qwen3.6-35B-A3B additionally sends the
-content-done partial message as separate `reasoning` / `content` fields, because its chat
-template rewrites the string form and the engine then rejects it with a 400.
+the gateway logs a warning at startup. On vLLM, some models (such as Qwen3.6-35B-A3B) additionally split
+the content-done partial message into separate `reasoning` / `content` fields.
 
 ```
                                leg1: original request
