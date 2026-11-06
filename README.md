@@ -7,7 +7,8 @@ English | [简体中文](README.zh-CN.md)
 > `CONTINUATION_ENGINE`. Within this project, each engine + model combination has its own
 > continuation strategy. The combinations verified so far:
 >
-> Status: ✅ verified, ❌ not supported.
+> Status: ✅ verified, ⚠️ supported with issues (continuation works, but with the problems described in
+> the notes), ❌ not supported.
 >
 > **SGLang (NVIDIA GPU, tested on v0.5.19+)**
 >
@@ -35,8 +36,10 @@ English | [简体中文](README.zh-CN.md)
 > | Qwen3-30B-A3B | ✅ Verified | Tested with the W8A8 weights |
 > | Qwen3-14B | ✅ Verified | |
 > | Qwen3-8B | ✅ Verified | |
+> | GLM-5.3-Flash | ✅ Verified | Tested with the W8A8 weights |
 > | Gemma-4-31B-it | ✅ Verified | The model itself is occasionally unstable: it may emit its control tokens as plain text in `content` (for example `</think>`, `<\|tool_call>`) so that the tool_call is not parsed and is lost. This comes from the model and its parser, not from how the continuation prefix is built |
 > | Gemma-4-26B-A4B-it | ✅ Verified | Same as Gemma-4-31B-it. Its reasoning may also occasionally end up in `content` |
+> | DeepSeek-V4.1-Flash-1017 | ⚠️ Supported with issues | Tested with the W4A8 weights. Requests are continued and tool_calls are produced, but the model's internal special tokens may leak into the continued output as plain text (for example `<ds_safety>…</ds_safety>`, `<DS_STREAMING>`, `@@INLINE_ICON@@`), in which case the answer may be cut short or end up in `reasoning` instead of `content`. A continuation from a short prefix may also drift off topic or switch language. The seam can occasionally lose or gain a character |
 > | Qwen3-Omni-30B-A3B-Instruct | ❌ Not supported | |
 >
 > The model names in the tables are exactly the strings `CONTINUATION_MODEL` should be set to
