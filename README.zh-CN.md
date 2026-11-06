@@ -6,7 +6,7 @@
 > 网关支持 **SGLang** 和 **vLLM** 两种推理引擎，通过 `CONTINUATION_ENGINE` 指定。本项目针对
 > 不同的「引擎 + 模型」组合各有对应的续写策略，目前已验证的组合如下：
 >
-> 状态：✅ 已验证，❌ 不支持。
+> 状态：✅ 已验证，⚠️ 支持但有问题（续写可用，但存在备注里描述的问题），❌ 不支持。
 >
 > **SGLang（NVIDIA GPU，在 v0.5.19+ 版本上验证）**
 >
@@ -34,8 +34,10 @@
 > | Qwen3-30B-A3B | ✅ 已验证 | 使用 W8A8 权重测试 |
 > | Qwen3-14B | ✅ 已验证 | |
 > | Qwen3-8B | ✅ 已验证 | |
+> | GLM-5.3-Flash | ✅ 已验证 | 使用 W8A8 权重测试 |
 > | Gemma-4-31B-it | ✅ 已验证 | 模型自身偶发不稳定：可能把控制 token 当作普通文本输出到 `content`（例如 `</think>`、`<\|tool_call>`），导致 tool_call 没有被解析出来而丢失。这来自模型及其解析器，不是续写前缀的构造问题 |
 > | Gemma-4-26B-A4B-it | ✅ 已验证 | 同 Gemma-4-31B-it；另外它的思考内容偶发会落进 `content` |
+> | DeepSeek-V4.1-Flash-1017 | ⚠️ 支持但有问题 | 使用 W4A8 权重测试。请求能够续写、tool_call 也能产出，但模型内部的特殊 token 可能以普通文本泄漏到续写内容里（例如 `<ds_safety>…</ds_safety>`、`<DS_STREAMING>`、`@@INLINE_ICON@@`），此时回答可能被截断，或落进 `reasoning` 而不是 `content`；前缀较短时续写还可能跑题、切换语言；断开处偶尔会丢字或多出字符 |
 > | Qwen3-Omni-30B-A3B-Instruct | ❌ 不支持 | |
 >
 > 表中的模型名就是 `CONTINUATION_MODEL` 应设置的字符串（大小写不敏感，精确匹配）。表中模型
