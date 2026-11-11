@@ -10,37 +10,41 @@ English | [简体中文](README.zh-CN.md)
 > Status: ✅ verified, ⚠️ supported with issues (continuation works, but with the problems described in
 > the notes), ❌ not supported.
 >
-> **SGLang (NVIDIA GPU, tested on v0.5.19+)**
+> **SGLang (NVIDIA GPU)**
 >
-> | Model | Status | Notes |
-> | --- | --- | --- |
-> | Kimi-K3 | ✅ Verified | |
-> | Qwen3.6-35B-A3B | ✅ Verified | |
-> | GLM-5.3 | ✅ Verified | |
+> | Model | Engine version | Status | Notes |
+> | --- | --- | --- | --- |
+> | Kimi-K3 | v0.5.19 | ✅ Verified | |
+> | Kimi-K3.1-Pro | dev-kimi-k31-pro | ✅ Verified | |
+> | Qwen3.6-35B-A3B | v0.5.19 | ✅ Verified | |
+> | Qwen3.8-27B | v0.5.19 | ✅ Verified | Tested with the FP8 weights |
+> | GLM-5.3 | v0.5.19 | ✅ Verified | |
+> | gpt-oss-20b | v0.5.19 | ❌ Not supported | |
 >
-> **vLLM (NVIDIA GPU, tested on v0.30.0+)**
+> **vLLM (NVIDIA GPU)**
 >
-> | Model | Status | Notes |
-> | --- | --- | --- |
-> | Qwen3.6-35B-A3B | ✅ Verified | |
-> | GLM-5.3 | ✅ Verified | |
-> | DeepSeek-V4-Flash-0731-nvfp4 | ✅ Verified | |
-> | Kimi-K3 | ✅ Verified | vLLM must be started with `--enable-scale-out`, otherwise continuation does not work. Multimodal requests are not continued |
+> | Model | Engine version | Status | Notes |
+> | --- | --- | --- | --- |
+> | Qwen3.6-35B-A3B | v0.31.0 | ✅ Verified | |
+> | GLM-5.3 | v0.31.0 | ✅ Verified | |
+> | DeepSeek-V4-Flash-0731-nvfp4 | v0.31.0 | ✅ Verified | |
+> | Kimi-K3 | v0.31.0 | ✅ Verified | vLLM must be started with `--enable-scale-out`, otherwise continuation does not work. Multimodal requests are not continued |
 >
-> **vLLM (Ascend 910B4, tested on vllm-ascend 0.30.0+)**
+> **vLLM (Ascend 910B4)** — tested via `vllm-ascend`; the engine version column below is the
+> `vllm-ascend` release.
 >
-> | Model | Status | Notes |
-> | --- | --- | --- |
-> | Qwen3.6-35B-A3B | ✅ Verified | Tested with the W8A8 weights |
-> | Qwen3.6-27B | ✅ Verified | Tested with the W8A8 weights |
-> | Qwen3-30B-A3B | ✅ Verified | Tested with the W8A8 weights |
-> | Qwen3-14B | ✅ Verified | |
-> | Qwen3-8B | ✅ Verified | |
-> | GLM-5.3-Flash | ✅ Verified | Tested with the W8A8 weights |
-> | Gemma-4-31B-it | ✅ Verified | The model itself is occasionally unstable: it may emit its control tokens as plain text in `content` (for example `</think>`, `<\|tool_call>`) so that the tool_call is not parsed and is lost. This comes from the model and its parser, not from how the continuation prefix is built |
-> | Gemma-4-26B-A4B-it | ✅ Verified | Same as Gemma-4-31B-it. Its reasoning may also occasionally end up in `content` |
-> | DeepSeek-V4.1-Flash-1017 | ⚠️ Supported with issues | Tested with the W4A8 weights. Requests are continued and tool_calls are produced, but the model's internal special tokens may leak into the continued output as plain text (for example `<ds_safety>…</ds_safety>`, `<DS_STREAMING>`, `@@INLINE_ICON@@`), in which case the answer may be cut short or end up in `reasoning` instead of `content`. A continuation from a short prefix may also drift off topic or switch language. The seam can occasionally lose or gain a character |
-> | Qwen3-Omni-30B-A3B-Instruct | ❌ Not supported | |
+> | Model | Engine version | Status | Notes |
+> | --- | --- | --- | --- |
+> | Qwen3.6-35B-A3B | v0.30.0 | ✅ Verified | Tested with the W8A8 weights |
+> | Qwen3.6-27B | v0.30.0 | ✅ Verified | Tested with the W8A8 weights |
+> | Qwen3-30B-A3B | v0.30.0 | ✅ Verified | Tested with the W8A8 weights |
+> | Qwen3-14B | v0.30.0 | ✅ Verified | |
+> | Qwen3-8B | v0.30.0 | ✅ Verified | |
+> | GLM-5.3-Flash | v0.30.0 | ✅ Verified | Tested with the W8A8 weights |
+> | Gemma-4-31B-it | v0.30.0 | ✅ Verified | The model itself is occasionally unstable: it may emit its control tokens as plain text in `content` (for example `</think>`, `<\|tool_call>`) so that the tool_call is not parsed and is lost. This comes from the model and its parser, not from how the continuation prefix is built |
+> | Gemma-4-26B-A4B-it | v0.30.0 | ✅ Verified | Same as Gemma-4-31B-it. Its reasoning may also occasionally end up in `content` |
+> | DeepSeek-V4.1-Flash-1017 | v0.30.0 | ⚠️ Supported with issues | Tested with the W4A8 weights. Requests are continued and tool_calls are produced, but the model's internal special tokens may leak into the continued output as plain text (for example `<ds_safety>…</ds_safety>`, `<DS_STREAMING>`, `@@INLINE_ICON@@`), in which case the answer may be cut short or end up in `reasoning` instead of `content`. A continuation from a short prefix may also drift off topic or switch language. The seam can occasionally lose or gain a character |
+> | Qwen3-Omni-30B-A3B-Instruct | v0.30.0 | ❌ Not supported | |
 >
 > The model names in the tables are exactly the strings `CONTINUATION_MODEL` should be set to
 > (case-insensitive, exact match). A quantized or fine-tuned variant of a listed model, such as

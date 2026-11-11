@@ -63,6 +63,7 @@ def _build_prefix_think_tag(reasoning: str, content: str) -> str:
 
 _BUILDERS = {
     "kimi-k3": _build_prefix_kimi_k3,
+    "kimi-k3.1-pro": _build_prefix_kimi_k3,
 }
 
 # 已验证过的「引擎 -> 模型型号」组合（README 兼容表里的模型名）。只用于启动时判断
@@ -70,7 +71,7 @@ _BUILDERS = {
 # builder 的型号（如 glm-5.3）走默认 <think> 格式，也在这里登记。vLLM 上的 Kimi-K3 走
 # render-generate 路径（见 uses_render_generate()），要求 vLLM 开启 --enable-scale-out。
 VERIFIED_MODELS = {
-    "sglang": ("kimi-k3", "qwen3.6-35b-a3b", "glm-5.3"),
+    "sglang": ("kimi-k3", "kimi-k3.1-pro", "qwen3.6-35b-a3b", "qwen3.8-27b", "glm-5.3"),
     "vllm": ("qwen3.6-35b-a3b", "qwen3.6-27b", "qwen3-30b-a3b", "qwen3-14b", "qwen3-8b",
              "gemma-4-31b-it", "gemma-4-26b-a4b-it", "glm-5.3", "deepseek-v4-flash-0731-nvfp4",
              "kimi-k3"),
