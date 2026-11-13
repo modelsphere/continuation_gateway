@@ -19,7 +19,16 @@ English | [简体中文](README.zh-CN.md)
 > | Qwen3.6-35B-A3B | v0.5.19 | ✅ Verified | |
 > | Qwen3.8-27B | v0.5.19 | ✅ Verified | Tested with the FP8 weights |
 > | GLM-5.3 | v0.5.19 | ✅ Verified | |
+> | Nemotron-3.5-Lightning-30B-A3B | dev-dsv41 | ✅ Verified | |
+> | MiMo-V2.5 | dev-dsv41 | ✅ Verified | |
+> | DeepSeek-V4.1-Flash-1017 | dev-dsv41 | ✅ Verified | |
+> | Step-3.5-Flash | dev-dsv41 | ✅ Verified | |
+> | Qwen3.8-Flash-Next | qwen38flashnext | ✅ Verified | |
+> | Ling-3.0-flash-VL | dev-Ling-3.0-flash-VL | ✅ Verified | |
+> | Nex-N2.5-Pro | dev-dsv41 | ✅ Verified | |
+> | Muse-Glimmer-30B | v0.5.19 | ⚠️ Supported with issues | When a request is continued after being cut off during reasoning, the continued reasoning shows up in `content` (without tools, the `<\|eom\|>` control token appears there too). Tool calls and the final answer are not affected. SGLang's Muse parser does not take the continuation prefix into account when deciding whether it is inside reasoning, so this cannot be avoided by how the prefix is built |
 > | gpt-oss-20b | v0.5.19 | ❌ Not supported | |
+> | gpt-oss-120b | v0.5.19 | ❌ Not supported | |
 >
 > **vLLM (NVIDIA GPU)**
 >
