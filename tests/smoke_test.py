@@ -905,8 +905,8 @@ async def main():
             gw_config.CONTINUATION_MODEL = "Qwen3.6-35B-A3B"
             call_counts["vllm_qwen_content_done"] = 0
             r_q_variant = await call_gateway("vllm_qwen_content_done")
-            gw_config.CONTINUATION_MODEL = "qwen3.6-27b"
-            r_q27 = await call_gateway("vllm_default_content_done")
+            gw_config.CONTINUATION_MODEL = "qwen3-32b"
+            r_unlisted = await call_gateway("vllm_default_content_done")
             gw_config.CONTINUATION_MODEL = "qwen3.6-35b-a3b"
             r_tp = await call_gateway("vllm_qwen_thinking_partial")
             gw_config.CONTINUATION_ENGINE = "sglang"
@@ -920,8 +920,8 @@ async def main():
               r_q["content"] == want and r_q["finish_reason"] == "stop", r_q["content"])
         check("vllm + differently-cased name (Qwen3.6-35B-A3B): structured message",
               r_q_variant["content"] == want and r_q_variant["finish_reason"] == "stop", r_q_variant["content"])
-        check("vllm + qwen3.6-27b (unverified, no match): string prefix",
-              r_q27["content"] == want and r_q27["finish_reason"] == "stop", r_q27["content"])
+        check("vllm + qwen3-32b (not in _STRUCTURED_CONTENT_DONE): string prefix",
+              r_unlisted["content"] == want and r_unlisted["finish_reason"] == "stop", r_unlisted["content"])
         check("vllm + qwen3.6-35b-a3b thinking-partial: string prefix",
               r_tp["reasoning"] == "step one. step two" and r_tp["finish_reason"] == "stop", r_tp["reasoning"])
         check("sglang + qwen3.6-35b-a3b content-done: string prefix",
@@ -992,6 +992,11 @@ async def main():
               match_key("DeepSeek-V4-Flash-0731-NVFP4", vl) == "deepseek-v4-flash-0731-nvfp4"
               and match_key("deepseek-v4-flash-0731", vl) is None
               and match_key("deepseek-v4-flash-0731-nvfp4", sg) is None)
+        check("VERIFIED_MODELS: models verified on sglang only (DeepSeek-V4.1-Flash-1017, Ling-3.0-flash-VL)",
+              match_key("DeepSeek-V4.1-Flash-1017", sg) == "deepseek-v4.1-flash-1017"
+              and match_key("Ling-3.0-flash-VL", sg) == "ling-3.0-flash-vl"
+              and match_key("DeepSeek-V4.1-Flash-1017", vl) is None
+              and match_key("Muse-Glimmer-30B", sg) is None)
         check("VERIFIED_MODELS: Kimi-K3 verified on both engines (vllm via render-generate)",
               match_key("kimi-k3", sg) == "kimi-k3" and match_key("kimi-k3", vl) == "kimi-k3")
 

@@ -71,7 +71,9 @@ _BUILDERS = {
 # builder 的型号（如 glm-5.3）走默认 <think> 格式，也在这里登记。vLLM 上的 Kimi-K3 走
 # render-generate 路径（见 uses_render_generate()），要求 vLLM 开启 --enable-scale-out。
 VERIFIED_MODELS = {
-    "sglang": ("kimi-k3", "kimi-k3.1-pro", "qwen3.6-35b-a3b", "qwen3.8-27b", "glm-5.3"),
+    "sglang": ("kimi-k3", "kimi-k3.1-pro", "qwen3.6-35b-a3b", "qwen3.8-27b", "glm-5.3",
+               "nemotron-3.5-lightning-30b-a3b", "mimo-v2.5", "deepseek-v4.1-flash-1017",
+               "step-3.5-flash", "qwen3.8-flash-next", "ling-3.0-flash-vl", "nex-n2.5-pro"),
     "vllm": ("qwen3.6-35b-a3b", "qwen3.6-27b", "qwen3-30b-a3b", "qwen3-14b", "qwen3-8b",
              "gemma-4-31b-it", "gemma-4-26b-a4b-it", "glm-5.3", "deepseek-v4-flash-0731-nvfp4",
              "kimi-k3"),

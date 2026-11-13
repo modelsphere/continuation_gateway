@@ -17,7 +17,16 @@
 > | Qwen3.6-35B-A3B | v0.5.19 | ✅ 已验证 | |
 > | Qwen3.8-27B | v0.5.19 | ✅ 已验证 | 使用 FP8 权重测试 |
 > | GLM-5.3 | v0.5.19 | ✅ 已验证 | |
+> | Nemotron-3.5-Lightning-30B-A3B | dev-dsv41 | ✅ 已验证 | |
+> | MiMo-V2.5 | dev-dsv41 | ✅ 已验证 | |
+> | DeepSeek-V4.1-Flash-1017 | dev-dsv41 | ✅ 已验证 | |
+> | Step-3.5-Flash | dev-dsv41 | ✅ 已验证 | |
+> | Qwen3.8-Flash-Next | qwen38flashnext | ✅ 已验证 | |
+> | Ling-3.0-flash-VL | dev-Ling-3.0-flash-VL | ✅ 已验证 | |
+> | Nex-N2.5-Pro | dev-dsv41 | ✅ 已验证 | |
+> | Muse-Glimmer-30B | v0.5.19 | ⚠️ 支持但有问题 | 在思考阶段中断后续写时，续写出的思考会出现在 `content` 中（不带 tools 时还会夹带 `<\|eom\|>` 控制符）；工具调用与最终回答不受影响。原因是 SGLang 的 Muse 解析器不根据续写前缀判断是否处于思考中，无法通过前缀构造规避 |
 > | gpt-oss-20b | v0.5.19 | ❌ 不支持 | |
+> | gpt-oss-120b | v0.5.19 | ❌ 不支持 | |
 >
 > **vLLM（NVIDIA GPU）**
 >
