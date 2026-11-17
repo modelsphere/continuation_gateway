@@ -14,44 +14,52 @@ English | [简体中文](README.zh-CN.md)
 >
 > | Model | Engine version | Status | Notes |
 > | --- | --- | --- | --- |
+> | DeepSeek-V4.1-Flash-1017 | dev-dsv41 | ✅ Verified | |
+> | Gemma-4-26B-A4B-it | v0.5.19 | ✅ Verified | |
+> | Gemma-4-31B-it | v0.5.19 | ✅ Verified | |
+> | GLM-5.3 | v0.5.19 | ✅ Verified | |
+> | Hy3 | dev-dsv41 | ✅ Verified | |
 > | Kimi-K3 | v0.5.19 | ✅ Verified | |
 > | Kimi-K3.1-Pro | dev-kimi-k31-pro | ✅ Verified | |
+> | Laguna-S-2.1 | dev-dsv41 | ✅ Verified | |
+> | Ling-3.0-flash-VL | dev-Ling-3.0-flash-VL | ✅ Verified | |
+> | MiMo-V2.5 | dev-dsv41 | ✅ Verified | |
+> | Mistral-Small-4-119B-2603 | v0.5.19 | ✅ Verified | SGLang must be started with `--tokenizer-path` pointing to a directory that holds only the HF tokenizer files (`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, etc.) and no `tekken.json`. If the model directory's `tekken.json` is picked up, SGLang uses the `mistral_common` tokenizer, and requests with tools are rejected (400) |
+> | Nemotron-3.5-Lightning-30B-A3B | dev-dsv41 | ✅ Verified | |
+> | Nex-N2.5-Pro | dev-dsv41 | ✅ Verified | |
 > | Qwen3.6-35B-A3B | v0.5.19 | ✅ Verified | |
 > | Qwen3.8-27B | v0.5.19 | ✅ Verified | Tested with the FP8 weights |
-> | GLM-5.3 | v0.5.19 | ✅ Verified | |
-> | Nemotron-3.5-Lightning-30B-A3B | dev-dsv41 | ✅ Verified | |
-> | MiMo-V2.5 | dev-dsv41 | ✅ Verified | |
-> | DeepSeek-V4.1-Flash-1017 | dev-dsv41 | ✅ Verified | |
-> | Step-3.5-Flash | dev-dsv41 | ✅ Verified | |
 > | Qwen3.8-Flash-Next | qwen38flashnext | ✅ Verified | |
-> | Ling-3.0-flash-VL | dev-Ling-3.0-flash-VL | ✅ Verified | |
-> | Nex-N2.5-Pro | dev-dsv41 | ✅ Verified | |
+> | Step-3.5-Flash | dev-dsv41 | ✅ Verified | |
 > | Muse-Glimmer-30B | v0.5.19 | ⚠️ Supported with issues | When a request is continued after being cut off during reasoning, the continued reasoning shows up in `content` (without tools, the `<\|eom\|>` control token appears there too). Tool calls and the final answer are not affected. SGLang's Muse parser does not take the continuation prefix into account when deciding whether it is inside reasoning, so this cannot be avoided by how the prefix is built |
-> | gpt-oss-20b | v0.5.19 | ❌ Not supported | |
 > | gpt-oss-120b | v0.5.19 | ❌ Not supported | |
+> | gpt-oss-20b | v0.5.19 | ❌ Not supported | |
 >
 > **vLLM (NVIDIA GPU)**
 >
 > | Model | Engine version | Status | Notes |
 > | --- | --- | --- | --- |
-> | Qwen3.6-35B-A3B | v0.31.0 | ✅ Verified | |
-> | GLM-5.3 | v0.31.0 | ✅ Verified | |
 > | DeepSeek-V4-Flash-0731-nvfp4 | v0.31.0 | ✅ Verified | |
+> | Gemma-4-26B-A4B-it | v0.31.0 | ✅ Verified | vLLM must be started with `--enable-scale-out`, otherwise continuation does not work |
+> | Gemma-4-31B-it | v0.31.0 | ✅ Verified | vLLM must be started with `--enable-scale-out`, otherwise continuation does not work |
+> | GLM-5.3 | v0.31.0 | ✅ Verified | |
 > | Kimi-K3 | v0.31.0 | ✅ Verified | vLLM must be started with `--enable-scale-out`, otherwise continuation does not work. Multimodal requests are not continued |
+> | Qwen3.6-35B-A3B | v0.31.0 | ✅ Verified | |
 >
 > **vLLM (Ascend 910B4)** — tested via `vllm-ascend`; the engine version column below is the
 > `vllm-ascend` release.
 >
 > | Model | Engine version | Status | Notes |
 > | --- | --- | --- | --- |
-> | Qwen3.6-35B-A3B | v0.30.0 | ✅ Verified | Tested with the W8A8 weights |
-> | Qwen3.6-27B | v0.30.0 | ✅ Verified | Tested with the W8A8 weights |
-> | Qwen3-30B-A3B | v0.30.0 | ✅ Verified | Tested with the W8A8 weights |
-> | Qwen3-14B | v0.30.0 | ✅ Verified | |
-> | Qwen3-8B | v0.30.0 | ✅ Verified | |
+> | Gemma-4-26B-A4B-it | v0.32.0rc1 | ✅ Verified | vLLM must be started with `--enable-scale-out`, otherwise continuation does not work |
+> | Gemma-4-31B-it | v0.32.0rc1 | ✅ Verified | vLLM must be started with `--enable-scale-out`, otherwise continuation does not work |
 > | GLM-5.3-Flash | v0.30.0 | ✅ Verified | Tested with the W8A8 weights |
-> | Gemma-4-31B-it | v0.30.0 | ✅ Verified | The model itself is occasionally unstable: it may emit its control tokens as plain text in `content` (for example `</think>`, `<\|tool_call>`) so that the tool_call is not parsed and is lost. This comes from the model and its parser, not from how the continuation prefix is built |
-> | Gemma-4-26B-A4B-it | v0.30.0 | ✅ Verified | Same as Gemma-4-31B-it. Its reasoning may also occasionally end up in `content` |
+> | MiniMax-M2.7 | v0.32.0rc1 | ✅ Verified | Tested with the W8A8-QuaRot weights. vLLM must be started with `--enable-scale-out`, otherwise continuation does not work |
+> | Qwen3-14B | v0.30.0 | ✅ Verified | |
+> | Qwen3-30B-A3B | v0.30.0 | ✅ Verified | Tested with the W8A8 weights |
+> | Qwen3-8B | v0.30.0 | ✅ Verified | |
+> | Qwen3.6-27B | v0.30.0 | ✅ Verified | Tested with the W8A8 weights |
+> | Qwen3.6-35B-A3B | v0.30.0 | ✅ Verified | Tested with the W8A8 weights |
 > | DeepSeek-V4.1-Flash-1017 | v0.30.0 | ⚠️ Supported with issues | Tested with the W4A8 weights. Requests are continued and tool_calls are produced, but the model's internal special tokens may leak into the continued output as plain text (for example `<ds_safety>…</ds_safety>`, `<DS_STREAMING>`, `@@INLINE_ICON@@`), in which case the answer may be cut short or end up in `reasoning` instead of `content`. A continuation from a short prefix may also drift off topic or switch language. The seam can occasionally lose or gain a character |
 > | Qwen3-Omni-30B-A3B-Instruct | v0.30.0 | ❌ Not supported | |
 >
@@ -78,12 +86,13 @@ carry on from there. To the client, it is still a single, continuous, complete s
 response.
 
 The way the prefix is assembled is determined by `CONTINUATION_MODEL` (the model this
-deployment actually serves; the `model` field of the request is not consulted), see
-`continuation_gateway/reconstruct.py`. Two formats are built in: Kimi-K3 (XTML) and a generic
-`<think>...</think>` format. Supporting a model with another format only takes adding a
-builder there. A model that matches no verified model is handled with the generic format, and
-the gateway logs a warning at startup. On vLLM, some models (such as Qwen3.6-35B-A3B) additionally split
-the content-done partial message into separate `reasoning` / `content` fields.
+deployment actually serves; the `model` field of the request is not consulted) and
+`CONTINUATION_ENGINE`. The default is a generic `<think>...</think>` format; some models use a
+format of their own (Kimi-K3, for example, uses XTML). See `continuation_gateway/reconstruct.py`
+for the details; supporting a model with another format only takes adding a builder there. A
+model that matches no verified model is handled with the generic format, and the gateway logs a
+warning at startup. On vLLM, some models (such as Qwen3.6-35B-A3B) additionally split the
+content-done partial message into separate `reasoning` / `content` fields.
 
 ```
                                leg1: original request
@@ -215,8 +224,8 @@ real continuation load to the downstream), `STALL_IDLE_TIMEOUT_SECONDS`,
 `CONNECT_TIMEOUT_SECONDS`, `MAX_CONTINUATION_BODY_MB`, `MAX_REQUEST_BODY_MB`,
 `CJK_CHARS_PER_TOKEN`, `OTHER_CHARS_PER_TOKEN`.
 
-`DERENDER_BATCH_CHUNKS` (default `8`, minimum `1`) only applies to the combination whose
-continuation leg uses render-generate (vLLM + Kimi-K3): that leg runs render, tokenize,
+`DERENDER_BATCH_CHUNKS` (default `8`, minimum `1`) only applies to combinations whose
+continuation leg uses render-generate (such as vLLM + Kimi-K3): that leg runs render, tokenize,
 `/inference/v1/generate` and derender against `CONTINUATION_URL`, so the address must expose
 all four endpoints (the vLLM server needs `--enable-scale-out`). Each derender call replays all
 previously generated tokens, so the generated chunks are batched, `DERENDER_BATCH_CHUNKS` of
