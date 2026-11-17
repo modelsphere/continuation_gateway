@@ -23,8 +23,10 @@ token 的图片请求，估算结果只有 12）；`_has_multimodal_content()` �
 usage.py `correct_usage()` 顶部注释。这条判断跟大 body 排除（MAX_CONTINUATION_BODY_MB）
 互不影响——多模态请求如果 body 超限，仍然会被那条规则挡在续写范畴外，两条规则各管各的。
 
-vLLM + Kimi-K3 的续写腿不走 chat-continue（K3 的渲染器不认 continue_final_message），改成
-render → tokenize → generate → derender 四步，见 render_generate.py 和 reconstruct.uses_render_generate()；
+vLLM + Kimi-K3、vLLM + MiniMax-M2.7、vLLM + Gemma-4 的续写腿不走 chat-continue（K3 的渲染器不认
+continue_final_message；MiniMax-M2.7 和 Gemma-4 的模板会改写最后一条 assistant 消息，续写请求被引擎拒绝），
+改成 render → tokenize → generate → derender 四步，见 render_generate.py 和
+reconstruct.uses_render_generate()；
 leg1 的监测、BUFFER_TOOL_CALLS、前置排除条件（包括 vLLM 下多模态请求透传）都和其它组合一致。
 
 跑法（下游预期是一个机房/集群路由网关，不是直连某个具体 SGLang 实例；实例选择/避开故障实例
@@ -395,7 +397,7 @@ async def relay_leg2(downstream_content, out: web.StreamResponse, splitter: Line
 async def attempt_render_generate(session: ClientSession, headers: dict, original_payload: dict,
                                   state: StreamState, out: web.StreamResponse, log_id: str, case: str,
                                   recovered, remaining_budget) -> None:
-    """续写腿的 render-generate 版本（vLLM + Kimi-K3，见 render_generate.py）。预算和 usage 修正
+    """续写腿的 render-generate 版本（见 render_generate.py）。预算和 usage 修正
     用的 recovered / remaining_budget 由 attempt_continuation() 和 chat-continue 路径用同一套逻辑
     算好；这里只负责把结果记成和 chat-continue 路径同一套 FAILED/SUCCEEDED 日志，下游的日志关联
     工具不用区分。"""

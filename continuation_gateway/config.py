@@ -24,7 +24,7 @@ CONTINUATION_MODEL = os.environ.get("CONTINUATION_MODEL", "").strip().lower()
 # SGLang 在顶层，vLLM 在 completion_tokens_details 里（见 usage.py）。
 CONTINUATION_ENGINE = os.environ.get("CONTINUATION_ENGINE", "sglang").strip().lower()
 
-# 续写腿走 render-generate 路径时（vLLM + Kimi-K3，见 render_generate.py），每累计这么多个
+# 续写腿走 render-generate 路径时（vLLM + Kimi-K3 / MiniMax-M2.7 / Gemma-4，见 render_generate.py），每累计这么多个
 # generate chunk 才调用一次 derender。derender 每次调用都会重放此前全部输出 token，并带着
 # 整个 prompt 的 token id，逐 chunk 调用的总开销随输出长度平方增长；调大这个值降低调用次数，
 # 代价是客户端看到的输出更成块。带 finish_reason 的结束 chunk 到达时无条件把剩余内容全部送出。

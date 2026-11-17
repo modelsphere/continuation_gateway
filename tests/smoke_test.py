@@ -89,7 +89,7 @@ async def downstream_chat(request: web.Request) -> web.StreamResponse:
         else:
             assert body.get("continue_final_message") is True
             # CONTINUATION_MODEL="test-model" 走的是通用 <think>...</think> builder（非 kimi-k3 的
-            # 默认分支，见 reconstruct.py _BUILDERS），XTML 分派单独在 kimi_k3_xtml_stall 场景测。
+            # 默认分支，见 reconstruct.py _PREFIX_BUILDERS），XTML 分派单独在 kimi_k3_xtml_stall 场景测。
             assert "</think>The answer is par" in body["messages"][-1]["content"]
             expected_budget = 1000 - (est("let me think. ") + est("The answer is par"))
             assert body.get("max_tokens") == expected_budget, \
@@ -522,12 +522,14 @@ async def continuation_downstream_chat(request: web.Request) -> web.StreamRespon
 
 
 # ---- vLLM + Kimi-K3 的 render-generate 续写腿：假的 render / tokenize / generate / derender ----------
-# 假 tokenizer：三个控制符各一个 token，think / response 紧跟在控制符后面时各一个 token，其余
-# 每个字符一个 token（10000 + ord）。
+# 假 tokenizer：三个控制符各一个 token，think / response 紧跟在控制符后面时各一个 token，
+# `<think>` / `</think>` 各一个 token（think-tag 格式用），其余每个字符一个 token（10000 + ord）。
 K3_OPEN, K3_CLOSE, K3_SEP, K3_THINK, K3_RESPONSE = 1000, 1001, 1002, 1003, 1004
+TT_OPEN, TT_CLOSE = 1005, 1006
 _K3_TOKEN_TABLE = {"<|open|>": K3_OPEN, "<|close|>": K3_CLOSE, "<|sep|>": K3_SEP,
-                   "think": K3_THINK, "response": K3_RESPONSE}
-_K3_TOKEN_RE = re.compile(r"<\|open\|>|<\|close\|>|<\|sep\|>|(?<=>)think|(?<=>)response|.", re.S)
+                   "think": K3_THINK, "response": K3_RESPONSE, "<think>": TT_OPEN, "</think>": TT_CLOSE}
+_K3_TOKEN_RE = re.compile(
+    r"<think>|</think>|<\|open\|>|<\|close\|>|<\|sep\|>|(?<=>)think|(?<=>)response|.", re.S)
 
 
 def k3_tokenize(text: str) -> list:
@@ -580,6 +582,52 @@ K3_RENDER_SCENARIOS = {
         "tail": [1, 2, 3],
         "gen": [],
         "gen_completion_tokens": 0,
+    },
+    # think-tag 格式（vllm + minimax-m2.7）：前缀只按 reasoning 是否为空拼，不看 prompt 末尾；
+    # prompt 末尾是 `<think>\n`（开着）或 `<think>\n\n</think>\n\n`（关着）只影响 derender。
+    "tt_render_thinking_partial": {
+        "leg1": [{"reasoning_content": "step one. "}],
+        "tail": [TT_OPEN, ch("\n")],
+        "gen": [([ch("x")], None), ([TT_CLOSE], None), ([ch("y")], None), ([ch("z")], "stop")],
+        "gen_completion_tokens": 4,
+    },
+    "tt_render_content_done": {
+        "leg1": [{"reasoning_content": "think.\n"}, {"content": "\n\nans"}],
+        "tail": [TT_OPEN, ch("\n")],
+        "gen": [([ch("y")], "stop")],
+        "gen_completion_tokens": 1,
+    },
+    "tt_render_thinking_closed": {
+        "leg1": [{"content": "abc"}],
+        "tail": [TT_OPEN, ch("\n"), ch("\n"), TT_CLOSE, ch("\n"), ch("\n")],
+        "gen": [([ch("y")], "stop")],
+        "gen_completion_tokens": 1,
+    },
+    # gemma4（vllm + gemma-4-*）：前缀开头按请求判断要不要写 `<|channel>thought\n`，闭合用
+    # `<channel|>`；假 render 的 tail 只是占位，网关不看 prompt 末尾。
+    "g4_render_thinking_partial": {
+        "leg1": [{"reasoning_content": "step one. "}],
+        "tail": [ch("\n")],
+        "gen": [([ch("x")], None), ([ch("y")], None), ([ch("z")], None), ([ch("w")], "stop")],
+        "gen_completion_tokens": 4,
+    },
+    "g4_render_content_done": {
+        "leg1": [{"reasoning_content": "think."}, {"content": "ans"}],
+        "tail": [ch("\n")],
+        "gen": [([ch("y")], "stop")],
+        "gen_completion_tokens": 1,
+    },
+    "g4_render_tool_prewritten": {
+        "leg1": [{"reasoning_content": "step two. "}],
+        "tail": [ch("\n")],
+        "gen": [([ch("y")], "stop")],
+        "gen_completion_tokens": 1,
+    },
+    "g4_render_thinking_closed": {
+        "leg1": [{"content": "abc"}],
+        "tail": [ch("\n")],
+        "gen": [([ch("y")], "stop")],
+        "gen_completion_tokens": 1,
     },
 }
 k3_record = {}  # scenario -> {"render": body, "tokenize": [...], "generate": body, "derender": [body, ...]}
@@ -1166,6 +1214,153 @@ async def main():
             check(f"{name}: leg2 fails cleanly, client keeps leg1's partial output",
                   [chunk_kind(c) for c in chunks] == ["content"] and k3_record[name]["generate"] is None,
                   [chunk_kind(c) for c in chunks])
+
+        print("\n== render-generate 续写腿（vllm + minimax-m2.7，think-tag 格式）==")
+        original = (gw_config.CONTINUATION_ENGINE, gw_config.CONTINUATION_MODEL, gw_config.DERENDER_BATCH_CHUNKS)
+        gw_config.CONTINUATION_ENGINE, gw_config.CONTINUATION_MODEL = "vllm", "MiniMax-M2.7"
+        gw_config.DERENDER_BATCH_CHUNKS = 3
+        try:
+            tt_runs = {}
+            for name in ("tt_render_thinking_partial", "tt_render_content_done",
+                         "tt_render_thinking_closed"):
+                tt_runs[name] = await call_gateway_chunks(name)
+        finally:
+            gw_config.CONTINUATION_ENGINE, gw_config.CONTINUATION_MODEL, gw_config.DERENDER_BATCH_CHUNKS = original
+
+        chunks, saw_done = tt_runs["tt_render_thinking_partial"]
+        rec = k3_record["tt_render_thinking_partial"]
+        head = k3_tokenize("hi") + [TT_OPEN, ch("\n")]
+        prefix_ids = k3_tokenize("step one. ")
+        check("think-tag: only the prefix is tokenized (no control-token lookup)",
+              [t["prompt"] for t in rec["tokenize"]] == ["step one. "], rec["tokenize"])
+        check("think-tag thinking-partial: generate token_ids = prompt + bare reasoning (no opening tag)",
+              rec["generate"]["token_ids"] == head + prefix_ids, rec["generate"]["token_ids"])
+        sent = [d["generate_chunk"]["choices"][0]["token_ids"] for d in rec["derender"]]
+        check("think-tag: derender batches of 3 chunks with no tail held back (</think> is one token)",
+              sent == [[ch("x"), TT_CLOSE, ch("y")], [ch("z")]], sent)
+        check("think-tag: derender gets the full prompt ids",
+              all(d["prompt_token_ids"] == head + prefix_ids for d in rec["derender"]))
+        check("think-tag: stream completes with usage and [DONE]",
+              saw_done and chunks[-1].get("usage") is not None, chunks[-1])
+
+        rec = k3_record["tt_render_content_done"]
+        check("think-tag content-done: reasoning + </think> + content, leg1 whitespace kept as-is",
+              rec["generate"]["token_ids"]
+              == head + k3_tokenize("think.\n") + [TT_CLOSE] + k3_tokenize("\n\nans"),
+              rec["generate"]["token_ids"])
+        check("think-tag content-done: only the prefix is tokenized",
+              [t["prompt"] for t in rec["tokenize"]] == ["think.\n</think>\n\nans"], rec["tokenize"])
+
+        rec = k3_record["tt_render_thinking_closed"]
+        check("think-tag without reasoning: prefix is the bare content",
+              rec["generate"]["token_ids"]
+              == k3_tokenize("hi") + K3_RENDER_SCENARIOS["tt_render_thinking_closed"]["tail"] + k3_tokenize("abc"),
+              rec["generate"]["token_ids"])
+
+        print("\n== render-generate 续写腿（vllm + gemma-4，gemma4 专属前缀，不做尾部顺延）==")
+        original = (gw_config.CONTINUATION_ENGINE, gw_config.CONTINUATION_MODEL, gw_config.DERENDER_BATCH_CHUNKS)
+        gw_config.CONTINUATION_ENGINE, gw_config.CONTINUATION_MODEL = "vllm", "Gemma-4-31B-it"
+        gw_config.DERENDER_BATCH_CHUNKS = 3
+        thinking_on = {"chat_template_kwargs": {"enable_thinking": True}}
+        tool_messages = {"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call-0", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call-0", "content": "ok"}]}
+        try:
+            g4_runs = {
+                "g4_render_thinking_partial": await call_gateway_chunks("g4_render_thinking_partial", extra=thinking_on),
+                "g4_render_content_done": await call_gateway_chunks("g4_render_content_done", extra=thinking_on),
+                "g4_render_tool_prewritten": await call_gateway_chunks(
+                    "g4_render_tool_prewritten", extra={**thinking_on, **tool_messages}),
+                "g4_render_thinking_closed": await call_gateway_chunks("g4_render_thinking_closed"),
+            }
+        finally:
+            gw_config.CONTINUATION_ENGINE, gw_config.CONTINUATION_MODEL, gw_config.DERENDER_BATCH_CHUNKS = original
+
+        g4_head = k3_tokenize("hi") + [ch("\n")]
+        chunks, saw_done = g4_runs["g4_render_thinking_partial"]
+        rec = k3_record["g4_render_thinking_partial"]
+        check("gemma4 thinking-partial (last message from user): prefix opens the channel itself",
+              [t["prompt"] for t in rec["tokenize"]] == ["<|channel>thought\nstep one. "], rec["tokenize"])
+        check("gemma4: generate token_ids = rendered prompt + tokenized prefix",
+              rec["generate"]["token_ids"] == g4_head + k3_tokenize("<|channel>thought\nstep one. "),
+              rec["generate"]["token_ids"])
+        sent = [d["generate_chunk"]["choices"][0]["token_ids"] for d in rec["derender"]]
+        check("gemma4: derender batches of 3 chunks sent as-is (no tail held back)",
+              sent == [[ch("x"), ch("y"), ch("z")], [ch("w")]], sent)
+        check("gemma4: derender gets the full prompt ids and the original request",
+              all(d["prompt_token_ids"] == rec["generate"]["token_ids"]
+                  and d["chat_request"].get("chat_template_kwargs") == {"enable_thinking": True}
+                  for d in rec["derender"]))
+        check("gemma4: stream completes with usage and [DONE]",
+              saw_done and chunks[-1].get("usage") is not None, chunks[-1])
+        rec = k3_record["g4_render_content_done"]
+        check("gemma4 content-done: <|channel>thought\\n + reasoning + <channel|> + content",
+              [t["prompt"] for t in rec["tokenize"]] == ["<|channel>thought\nthink.<channel|>ans"], rec["tokenize"])
+        rec = k3_record["g4_render_tool_prewritten"]
+        check("gemma4 after a tool reply with thinking on: channel already opened by the prompt, prefix is bare",
+              [t["prompt"] for t in rec["tokenize"]] == ["step two. "], rec["tokenize"])
+        rec = k3_record["g4_render_thinking_closed"]
+        check("gemma4 without reasoning: prefix is the bare content",
+              [t["prompt"] for t in rec["tokenize"]] == ["abc"], rec["tokenize"])
+
+        from continuation_gateway.reconstruct import build_gemma4_render_prefix, gemma4_channel_prewritten
+        check("gemma4 render prefix: head only when the prompt has not opened the channel",
+              build_gemma4_render_prefix("R", "", False) == "<|channel>thought\nR"
+              and build_gemma4_render_prefix("R", "C", False) == "<|channel>thought\nR<channel|>C"
+              and build_gemma4_render_prefix("R", "", True) == "R"
+              and build_gemma4_render_prefix("R", "C", True) == "R<channel|>C"
+              and build_gemma4_render_prefix("", "C", False) == "C"
+              and build_gemma4_render_prefix("", "C", True) == "C")
+        check("gemma4 channel prewritten only after a tool reply with enable_thinking",
+              gemma4_channel_prewritten({**thinking_on, **tool_messages})
+              and not gemma4_channel_prewritten(tool_messages)
+              and not gemma4_channel_prewritten({**thinking_on, "messages": [{"role": "user", "content": "hi"}]})
+              and not gemma4_channel_prewritten({**tool_messages, "chat_template_kwargs": {"enable_thinking": False}}))
+
+        print("\n== 前缀 builder 分派：按引擎 + 模型 ==")
+        from continuation_gateway.reconstruct import (
+            build_assistant_message, build_prefix, build_render_prefix, uses_render_generate)
+        for engine, model, reasoning, content, want in [
+            ("sglang", "gemma-4-26b-a4b-it", "R", "C", "<|channel>thought\nR<channel|>C"),
+            ("sglang", "Gemma-4-31B-it", "R", "", "<|channel>thought\nR"),
+            ("sglang", "gemma-4-31b-it", "", "C", "<|channel>thought\n<channel|>C"),
+            ("vllm", "gemma-4-31b-it", "R", "C", "<think>R</think>C"),
+            ("sglang", "Hy3", "R", "C", "<think:opensource>R</think:opensource>C"),
+            ("sglang", "hy3", "", "C", "<think:opensource></think:opensource>C"),
+            ("sglang", "hy3", "R", "", "<think:opensource>R"),
+            ("sglang", "Mistral-Small-4-119B-2603", "R", "C", "[THINK]R[/THINK]C"),
+            ("sglang", "mistral-small-4-119b-2603", "", "C", "C"),
+            ("sglang", "mistral-small-4-119b-2603", "R", "", "[THINK]R"),
+            ("sglang", "kimi-k3", "R", "C", "<|open|>think<|sep|>R<|close|>think<|sep|><|open|>response<|sep|>C"),
+            ("sglang", "kimi-k3.1-pro", "R", "", "<|open|>think<|sep|>R"),
+            ("vllm", "kimi-k3.1-pro", "R", "C", "<think>R</think>C"),
+            ("sglang", "hy3-preview", "R", "C", "<think>R</think>C"),
+        ]:
+            got = build_prefix(engine, model, reasoning, content)
+            check(f"build_prefix({engine}, {model!r}, R={reasoning!r}, C={content!r})", got == want, got)
+        check("build_assistant_message carries the engine-scoped prefix",
+              build_assistant_message("sglang", "hy3", "R", "C")
+              == {"role": "assistant", "content": "<think:opensource>R</think:opensource>C"})
+        check("render-generate: kimi-k3 / minimax-m2.7 / gemma-4 on vllm only",
+              uses_render_generate("vllm", "kimi-k3")
+              and uses_render_generate("vllm", "MiniMax-M2.7")
+              and uses_render_generate("vllm", "gemma-4-26b-a4b-it")
+              and uses_render_generate("vllm", "Gemma-4-31B-it")
+              and not uses_render_generate("sglang", "gemma-4-31b-it")
+              and not uses_render_generate("sglang", "minimax-m2.7")
+              and not uses_render_generate("vllm", "minimax-m2.5")
+              and not uses_render_generate("sglang", "kimi-k3"))
+        check("generic render prefix: R / R</think>C / C by whether reasoning is empty",
+              build_render_prefix("R", "") == "R"
+              and build_render_prefix("R", "C") == "R</think>C"
+              and build_render_prefix("", "C") == "C")
+        check("VERIFIED_MODELS: gemma-4 / hy3 / mistral-small-4 / laguna-s-2.1 on sglang, minimax-m2.7 on vllm",
+              all(match_key(m, sg) for m in ("gemma-4-26b-a4b-it", "gemma-4-31b-it", "Hy3",
+                                             "Mistral-Small-4-119B-2603", "Laguna-S-2.1"))
+              and match_key("MiniMax-M2.7", vl) == "minimax-m2.7"
+              and match_key("MiniMax-M2.7", sg) is None)
 
         print("\n== vllm_multimodal_passthrough (CONTINUATION_ENGINE=vllm 时多模态请求不进续写) ==")
         original_engine = gw_config.CONTINUATION_ENGINE

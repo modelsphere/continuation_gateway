@@ -1,24 +1,29 @@
-"""崩溃前那条腿的 assistant partial 前缀构造。不同模型家族拼 partial assistant 消息用的
-控制 token 不一样（Kimi-K3 是自成一套的 XTML 方案，Kimi-K2 系走的是经典 <think>...</think>
-sentinel token 方案），按部署所服务的真实模型（config.CONTINUATION_MODEL，不是请求里的
-model 字段）分派到各自的构造函数，见 _BUILDERS——没有专门适配过的模型落到
-_build_prefix_think_tag（<think>...</think> 格式）：这是目前已知模型里除 Kimi-K3 外
-的通用写法，但不保证覆盖所有未来接入的模型，真遇到别的格式要在这里加一个专门的 builder，
-不要指望默认格式蒙对。
+"""崩溃前那条腿的 assistant partial 前缀构造。前缀怎么拼由部署的「引擎 + 真实模型」决定
+（config.CONTINUATION_ENGINE / config.CONTINUATION_MODEL，不看请求里的 model 字段），续写腿按
+引擎分两种形态。
+
+chat-continue（两个引擎的默认形态）：最后一条 assistant 消息带上前缀，发 continue_final_message。
+前缀 builder 按引擎登记在 _PREFIX_BUILDERS 里，没登记的组合落到 _build_prefix_think_tag
+（<think>...</think> 格式）：这是多数模型的通用写法，但不保证覆盖所有未来接入的模型，真遇到别的
+格式要加一个专门的 builder，不要指望默认格式蒙对。两个引擎分开登记，是因为同一个前缀在两个引擎上
+不一定都成立：SGLang 的 reasoning parser 根据 previous_content（最后一条 assistant 消息的
+content）里有没有模型自己的思考起止 token 决定续写从哪个状态起步，前缀不用模型自己的 token 时，
+续写出的思考会落进 content、收尾标记原样漏出；vLLM 要求最后一条消息的 content 原样出现在渲染
+结果里，有的模板会剥掉或重排 assistant content 里的思考段（如 Gemma-4 的 strip_thinking），
+在 SGLang 上可用的原生前缀到 vLLM 上可能直接被拒（400）。vLLM 上另有一类组合在 content-done 时
+改发 reasoning / content 分开的结构化消息，见 _STRUCTURED_CONTENT_DONE 和 build_assistant_message()。
+
+render-generate（只有 vLLM 有这套接口）：渲染器不认 continue_final_message 的（Kimi-K3），或者
+模板会改写最后一条 assistant 消息、chat-continue 必然被拒的（MiniMax-M2.7 的模板会把 content 里的
+`<think>R</think>` 拆出去；Gemma-4 的模板会剥掉 `<|channel>...<channel|>`），续写腿改成 render →
+tokenize → generate → derender 四步，见 _VLLM_RENDER_GENERATE 和 render_generate.py。这条路径的
+前缀不带开头标签（render 出来的 prompt 已经打开了思考通道），默认用 build_render_prefix() 的通用
+写法，Kimi-K3 用 build_k3_render_prefix()，Gemma-4 用 build_gemma4_render_prefix()（generation
+prompt 不一定打开思考通道，开头按请求判断）。
 
 模型名按 match_key() 匹配：归一化（大小写、空白、下划线）后精确匹配。表里的 key 就是已验证的
 完整型号，也是 CONTINUATION_MODEL 应该设置的字符串；已验证模型的量化版、微调版也应该直接
 设置成该型号的名字（如 GLM-5.3-FP8 设置成 glm-5.3），没验证过的型号和版本不会被误命中。
-
-除了前缀格式，还有一类「引擎 + 模型」组合的特例：vLLM 的 continue_final_message 要求最后
-一条消息的 content 原样出现在渲染后的 prompt 里，有的模板会重排 `<think>R</think>C`，让整串
-字符串前缀被引擎以 400 拒绝，这类组合在 content-done 时改发 reasoning / content 分开的结构化
-消息，见 _STRUCTURED_CONTENT_DONE 和 build_assistant_message()。
-
-还有一类组合不走 chat-continue：渲染器不认 continue_final_message 的「引擎 + 模型」（目前只有
-vLLM + Kimi-K3），续写腿改成 render → tokenize → generate → derender 四步，见 uses_render_generate()
-和 render_generate.py；这条路径的前缀不带开头标签（render 出来的 prompt 已经打开了思考通道），
-见 build_k3_render_prefix()。
 
 当前只覆盖自由文本、且崩溃时还没出现过 tool_call chunk 的情况，所以运行时只需要判断
 content 是否非空：非空说明 thinking 阶段已经结束（content-done），为空则保守按"可能还在
@@ -32,6 +37,9 @@ import re
 XTML_OPEN = "<|open|>"
 XTML_CLOSE = "<|close|>"
 XTML_SEP = "<|sep|>"
+
+THINK_OPEN = "<think>"
+THINK_CLOSE = "</think>"
 
 
 def _build_prefix_kimi_k3(reasoning: str, content: str) -> str:
@@ -57,26 +65,86 @@ def _build_prefix_think_tag(reasoning: str, content: str) -> str:
     think 标签"这条保守策略跟 _build_prefix_kimi_k3 一致，理由见那边的说明。
     """
     if content:
-        return f"<think>{reasoning}</think>{content}"
-    return f"<think>{reasoning}"
+        return f"{THINK_OPEN}{reasoning}{THINK_CLOSE}{content}"
+    return f"{THINK_OPEN}{reasoning}"
 
 
-_BUILDERS = {
-    "kimi-k3": _build_prefix_kimi_k3,
-    "kimi-k3.1-pro": _build_prefix_kimi_k3,
+GEMMA4_CHANNEL_OPEN = "<|channel>"
+GEMMA4_CHANNEL_CLOSE = "<channel|>"
+GEMMA4_THOUGHT_LABEL = "thought\n"
+
+
+def _build_prefix_gemma4(reasoning: str, content: str) -> str:
+    """Gemma-4 原生的思考通道：`<|channel>thought\\n{reasoning}<channel|>{content}`，与 SGLang
+    Gemma4Detector 的 think_start_token / think_start_self_label / think_end_token 一致。
+    content 非空时总是写出完整的通道（reasoning 为空就是空通道，模板在不思考时也写空通道）；
+    content 为空时通道不闭合，理由见 _build_prefix_kimi_k3。"""
+    if content:
+        return f"{GEMMA4_CHANNEL_OPEN}{GEMMA4_THOUGHT_LABEL}{reasoning}{GEMMA4_CHANNEL_CLOSE}{content}"
+    return f"{GEMMA4_CHANNEL_OPEN}{GEMMA4_THOUGHT_LABEL}{reasoning}"
+
+
+HY3_THINK_OPEN = "<think:opensource>"
+HY3_THINK_CLOSE = "</think:opensource>"
+
+
+def _build_prefix_hy3(reasoning: str, content: str) -> str:
+    """Hy3 的思考 token 带 `:opensource` 后缀（词表里的 added token，SGLang HunyuanDetector 从
+    词表取出带后缀的 token 作为思考起止）。字面 `</think>` 不会让解析器切出思考状态：
+    reasoning_effort 不是 none 时解析器从思考状态起步，content-done 用 `</think>` 闭合时续写的
+    正文会整段落进 reasoning。content 非空时总是写出完整的 think 块（reasoning 为空就是空块，
+    与模板 no_think 时的 generation prompt 一致）；content 为空时不闭合，理由见 _build_prefix_kimi_k3。"""
+    if content:
+        return f"{HY3_THINK_OPEN}{reasoning}{HY3_THINK_CLOSE}{content}"
+    return f"{HY3_THINK_OPEN}{reasoning}"
+
+
+MISTRAL_THINK_OPEN = "[THINK]"
+MISTRAL_THINK_CLOSE = "[/THINK]"
+
+
+def _build_prefix_mistral(reasoning: str, content: str) -> str:
+    """Mistral tekken 新版的思考 special token `[THINK]` / `[/THINK]`，与 SGLang MistralDetector 和
+    模型自带模板渲染 reasoning_content 的方式一致。content 非空、reasoning 为空时只写 content：
+    模板在不思考时不写空的 think 块。content 为空时不闭合，理由见 _build_prefix_kimi_k3。
+
+    前缀里的 `[THINK]` 要被编码回 special token 才有意义：引擎需要用 HF tokenizer（tokenizer.json
+    里这两个是 special token），mistral_common tokenizer 不保证把字面文本还原成控制 token。"""
+    if content:
+        if not reasoning:
+            return content
+        return f"{MISTRAL_THINK_OPEN}{reasoning}{MISTRAL_THINK_CLOSE}{content}"
+    return f"{MISTRAL_THINK_OPEN}{reasoning}"
+
+
+# 引擎 -> 模型型号 -> chat-continue 的前缀 builder，没登记的落到 _build_prefix_think_tag，
+# 两个引擎分开登记的原因见模块说明。
+_PREFIX_BUILDERS = {
+    "sglang": {
+        "kimi-k3": _build_prefix_kimi_k3,
+        "kimi-k3.1-pro": _build_prefix_kimi_k3,
+        "gemma-4-26b-a4b-it": _build_prefix_gemma4,
+        "gemma-4-31b-it": _build_prefix_gemma4,
+        "hy3": _build_prefix_hy3,
+        "mistral-small-4-119b-2603": _build_prefix_mistral,
+    },
+    "vllm": {},
 }
 
 # 已验证过的「引擎 -> 模型型号」组合（README 兼容表里的模型名）。只用于启动时判断
 # CONTINUATION_MODEL 在当前 CONTINUATION_ENGINE 上有没有验证过，不参与任何分发；没有专门
-# builder 的型号（如 glm-5.3）走默认 <think> 格式，也在这里登记。vLLM 上的 Kimi-K3 走
-# render-generate 路径（见 uses_render_generate()），要求 vLLM 开启 --enable-scale-out。
+# builder 的型号（如 glm-5.3）走默认 <think> 格式，也在这里登记。vLLM 上的 Kimi-K3、
+# MiniMax-M2.7 和 Gemma-4 走 render-generate 路径（见 uses_render_generate()），要求 vLLM 开启
+# --enable-scale-out。
 VERIFIED_MODELS = {
     "sglang": ("kimi-k3", "kimi-k3.1-pro", "qwen3.6-35b-a3b", "qwen3.8-27b", "glm-5.3",
                "nemotron-3.5-lightning-30b-a3b", "mimo-v2.5", "deepseek-v4.1-flash-1017",
-               "step-3.5-flash", "qwen3.8-flash-next", "ling-3.0-flash-vl", "nex-n2.5-pro"),
+               "step-3.5-flash", "qwen3.8-flash-next", "ling-3.0-flash-vl", "nex-n2.5-pro",
+               "gemma-4-26b-a4b-it", "gemma-4-31b-it", "hy3", "mistral-small-4-119b-2603",
+               "laguna-s-2.1"),
     "vllm": ("qwen3.6-35b-a3b", "qwen3.6-27b", "qwen3-30b-a3b", "qwen3-14b", "qwen3-8b",
              "gemma-4-31b-it", "gemma-4-26b-a4b-it", "glm-5.3", "deepseek-v4-flash-0731-nvfp4",
-             "kimi-k3"),
+             "kimi-k3", "minimax-m2.7"),
 }
 
 # 关思考开关在 chat_template_kwargs 里的 key：默认 `thinking`，Qwen3 系的模板读的是
@@ -111,18 +179,21 @@ def match_key(model: str, keys) -> str:
     return None
 
 
-# 引擎 -> 该引擎上续写腿走 render-generate 的模型型号。
-_RENDER_GENERATE = {
-    "vllm": ("kimi-k3",),
-}
+# vLLM 上续写腿走 render-generate 的模型型号。只有 vLLM 有这套接口，所以不按引擎分层。前缀默认用
+# build_render_prefix() 的通用写法；需要专属处理的模型（Kimi-K3、Gemma-4）在 render_generate.py
+# 里分发。Gemma-4 的模板会剥掉 assistant content 里的 `<|channel>...<channel|>`，原生前缀走
+# chat-continue 会被拒（400），所以也走这条路径。
+_VLLM_RENDER_GENERATE = ("kimi-k3", "minimax-m2.7", "gemma-4-26b-a4b-it", "gemma-4-31b-it")
 
 
 def uses_render_generate(engine: str, model: str) -> bool:
-    return bool(match_key(model, _RENDER_GENERATE.get(engine, ())))
+    return engine == "vllm" and bool(match_key(model, _VLLM_RENDER_GENERATE))
 
 
-def build_prefix(model: str, reasoning: str, content: str) -> str:
-    builder = _BUILDERS.get(match_key(model, _BUILDERS), _build_prefix_think_tag)
+def build_prefix(engine: str, model: str, reasoning: str, content: str) -> str:
+    """chat-continue 形态的字符串前缀。"""
+    table = _PREFIX_BUILDERS.get(engine, {})
+    builder = table.get(match_key(model, table), _build_prefix_think_tag)
     return builder(reasoning, content)
 
 
@@ -141,7 +212,7 @@ def build_assistant_message(engine: str, model: str, reasoning: str, content: st
     """
     if content and match_key(model, _STRUCTURED_CONTENT_DONE.get(engine, ())):
         return {"role": "assistant", "reasoning": reasoning, "content": content}
-    return {"role": "assistant", "content": build_prefix(model, reasoning, content)}
+    return {"role": "assistant", "content": build_prefix(engine, model, reasoning, content)}
 
 
 def thinking_disable_kwargs(model: str, content: str) -> dict:
@@ -179,6 +250,37 @@ def build_k3_render_prefix(reasoning: str, content: str, thinking_open: bool) ->
             f"{XTML_OPEN}response{XTML_SEP}{content}"
         )
     return reasoning
+
+
+def build_render_prefix(reasoning: str, content: str) -> str:
+    """render-generate 路径的通用前缀：generation prompt 末尾已经打开了思考，这里不写开头标签。
+    reasoning 为空说明没有思考（或请求关了思考，prompt 末尾是闭合的空思考块），只接 content，
+    不能再写闭合标签。思考是开是关由 derender 的 parser 按完整 prompt 判断。"""
+    if content:
+        return f"{reasoning}{THINK_CLOSE}{content}" if reasoning else content
+    return reasoning
+
+
+def gemma4_channel_prewritten(payload: dict) -> bool:
+    """Gemma-4 的 generation prompt 是否已经写了 `<|channel>thought\\n`：最后一条消息是 tool 回复、
+    且 chat_template_kwargs.enable_thinking 为真时，模板在同一个 model 回合里接着写，并预先打开思考
+    通道；其余情况 generation prompt 只写到 `<|turn>model\\n`（思考打开时通道由模型自己打开），或
+    写一个闭合的空通道（思考关闭）。"""
+    messages = payload.get("messages") or []
+    thinking = (payload.get("chat_template_kwargs") or {}).get("enable_thinking")
+    return bool(messages) and messages[-1].get("role") == "tool" and bool(thinking)
+
+
+def build_gemma4_render_prefix(reasoning: str, content: str, channel_prewritten: bool) -> str:
+    """render-generate 路径的 Gemma-4 前缀。Gemma-4 不满足「generation prompt 已经打开思考」这个
+    通用前提，开头要按 channel_prewritten（见 gemma4_channel_prewritten()）决定：已预写时不写，
+    否则前缀自己带 `<|channel>thought\\n`（和 chat-continue 的 _build_prefix_gemma4 相同）。闭合用
+    `<channel|>`，不是 `</think>`。reasoning 为空（思考关闭，prompt 末尾已是闭合的空通道）时只接
+    content。思考是开是关由 derender 的 gemma4 parser 从完整 prompt 末尾往回找 `<|channel>` 判断。"""
+    head = "" if channel_prewritten else f"{GEMMA4_CHANNEL_OPEN}{GEMMA4_THOUGHT_LABEL}"
+    if content:
+        return f"{head}{reasoning}{GEMMA4_CHANNEL_CLOSE}{content}" if reasoning else content
+    return f"{head}{reasoning}"
 
 
 def classify_case(tool_calls_seen: bool, reasoning: str, content: str) -> str:

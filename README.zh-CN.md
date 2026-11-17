@@ -12,44 +12,52 @@
 >
 > | 模型 | 测试引擎版本 | 状态 | 备注 |
 > | --- | --- | --- | --- |
+> | DeepSeek-V4.1-Flash-1017 | dev-dsv41 | ✅ 已验证 | |
+> | Gemma-4-26B-A4B-it | v0.5.19 | ✅ 已验证 | |
+> | Gemma-4-31B-it | v0.5.19 | ✅ 已验证 | |
+> | GLM-5.3 | v0.5.19 | ✅ 已验证 | |
+> | Hy3 | dev-dsv41 | ✅ 已验证 | |
 > | Kimi-K3 | v0.5.19 | ✅ 已验证 | |
 > | Kimi-K3.1-Pro | dev-kimi-k31-pro | ✅ 已验证 | |
+> | Laguna-S-2.1 | dev-dsv41 | ✅ 已验证 | |
+> | Ling-3.0-flash-VL | dev-Ling-3.0-flash-VL | ✅ 已验证 | |
+> | MiMo-V2.5 | dev-dsv41 | ✅ 已验证 | |
+> | Mistral-Small-4-119B-2603 | v0.5.19 | ✅ 已验证 | SGLang 必须用 `--tokenizer-path` 指向一个只含 HF tokenizer 文件（`tokenizer.json`、`tokenizer_config.json`、`chat_template.jinja` 等）、不含 `tekken.json` 的目录；用到模型目录里的 `tekken.json` 时会走 `mistral_common` tokenizer，带 tools 的请求会被拒绝（400） |
+> | Nemotron-3.5-Lightning-30B-A3B | dev-dsv41 | ✅ 已验证 | |
+> | Nex-N2.5-Pro | dev-dsv41 | ✅ 已验证 | |
 > | Qwen3.6-35B-A3B | v0.5.19 | ✅ 已验证 | |
 > | Qwen3.8-27B | v0.5.19 | ✅ 已验证 | 使用 FP8 权重测试 |
-> | GLM-5.3 | v0.5.19 | ✅ 已验证 | |
-> | Nemotron-3.5-Lightning-30B-A3B | dev-dsv41 | ✅ 已验证 | |
-> | MiMo-V2.5 | dev-dsv41 | ✅ 已验证 | |
-> | DeepSeek-V4.1-Flash-1017 | dev-dsv41 | ✅ 已验证 | |
-> | Step-3.5-Flash | dev-dsv41 | ✅ 已验证 | |
 > | Qwen3.8-Flash-Next | qwen38flashnext | ✅ 已验证 | |
-> | Ling-3.0-flash-VL | dev-Ling-3.0-flash-VL | ✅ 已验证 | |
-> | Nex-N2.5-Pro | dev-dsv41 | ✅ 已验证 | |
+> | Step-3.5-Flash | dev-dsv41 | ✅ 已验证 | |
 > | Muse-Glimmer-30B | v0.5.19 | ⚠️ 支持但有问题 | 在思考阶段中断后续写时，续写出的思考会出现在 `content` 中（不带 tools 时还会夹带 `<\|eom\|>` 控制符）；工具调用与最终回答不受影响。原因是 SGLang 的 Muse 解析器不根据续写前缀判断是否处于思考中，无法通过前缀构造规避 |
-> | gpt-oss-20b | v0.5.19 | ❌ 不支持 | |
 > | gpt-oss-120b | v0.5.19 | ❌ 不支持 | |
+> | gpt-oss-20b | v0.5.19 | ❌ 不支持 | |
 >
 > **vLLM（NVIDIA GPU）**
 >
 > | 模型 | 测试引擎版本 | 状态 | 备注 |
 > | --- | --- | --- | --- |
-> | Qwen3.6-35B-A3B | v0.31.0 | ✅ 已验证 | |
-> | GLM-5.3 | v0.31.0 | ✅ 已验证 | |
 > | DeepSeek-V4-Flash-0731-nvfp4 | v0.31.0 | ✅ 已验证 | |
+> | Gemma-4-26B-A4B-it | v0.31.0 | ✅ 已验证 | vLLM 必须开启 `--enable-scale-out`，否则续写无效 |
+> | Gemma-4-31B-it | v0.31.0 | ✅ 已验证 | vLLM 必须开启 `--enable-scale-out`，否则续写无效 |
+> | GLM-5.3 | v0.31.0 | ✅ 已验证 | |
 > | Kimi-K3 | v0.31.0 | ✅ 已验证 | vLLM 必须开启 `--enable-scale-out`，否则续写无效；不支持多模态请求的续写 |
+> | Qwen3.6-35B-A3B | v0.31.0 | ✅ 已验证 | |
 >
 > **vLLM（昇腾 910B4）**——测试的是 `vllm-ascend`，下表「测试引擎版本」一列填的是
 > `vllm-ascend` 的版本号。
 >
 > | 模型 | 测试引擎版本 | 状态 | 备注 |
 > | --- | --- | --- | --- |
-> | Qwen3.6-35B-A3B | v0.30.0 | ✅ 已验证 | 使用 W8A8 权重测试 |
-> | Qwen3.6-27B | v0.30.0 | ✅ 已验证 | 使用 W8A8 权重测试 |
-> | Qwen3-30B-A3B | v0.30.0 | ✅ 已验证 | 使用 W8A8 权重测试 |
-> | Qwen3-14B | v0.30.0 | ✅ 已验证 | |
-> | Qwen3-8B | v0.30.0 | ✅ 已验证 | |
+> | Gemma-4-26B-A4B-it | v0.32.0rc1 | ✅ 已验证 | vLLM 必须开启 `--enable-scale-out`，否则续写无效 |
+> | Gemma-4-31B-it | v0.32.0rc1 | ✅ 已验证 | vLLM 必须开启 `--enable-scale-out`，否则续写无效 |
 > | GLM-5.3-Flash | v0.30.0 | ✅ 已验证 | 使用 W8A8 权重测试 |
-> | Gemma-4-31B-it | v0.30.0 | ✅ 已验证 | 模型自身偶发不稳定：可能把控制 token 当作普通文本输出到 `content`（例如 `</think>`、`<\|tool_call>`），导致 tool_call 没有被解析出来而丢失。这来自模型及其解析器，不是续写前缀的构造问题 |
-> | Gemma-4-26B-A4B-it | v0.30.0 | ✅ 已验证 | 同 Gemma-4-31B-it；另外它的思考内容偶发会落进 `content` |
+> | MiniMax-M2.7 | v0.32.0rc1 | ✅ 已验证 | 使用 W8A8-QuaRot 权重测试；vLLM 必须开启 `--enable-scale-out`，否则续写无效 |
+> | Qwen3-14B | v0.30.0 | ✅ 已验证 | |
+> | Qwen3-30B-A3B | v0.30.0 | ✅ 已验证 | 使用 W8A8 权重测试 |
+> | Qwen3-8B | v0.30.0 | ✅ 已验证 | |
+> | Qwen3.6-27B | v0.30.0 | ✅ 已验证 | 使用 W8A8 权重测试 |
+> | Qwen3.6-35B-A3B | v0.30.0 | ✅ 已验证 | 使用 W8A8 权重测试 |
 > | DeepSeek-V4.1-Flash-1017 | v0.30.0 | ⚠️ 支持但有问题 | 使用 W4A8 权重测试。请求能够续写、tool_call 也能产出，但模型内部的特殊 token 可能以普通文本泄漏到续写内容里（例如 `<ds_safety>…</ds_safety>`、`<DS_STREAMING>`、`@@INLINE_ICON@@`），此时回答可能被截断，或落进 `reasoning` 而不是 `content`；前缀较短时续写还可能跑题、切换语言；断开处偶尔会丢字或多出字符 |
 > | Qwen3-Omni-30B-A3B-Instruct | v0.30.0 | ❌ 不支持 | |
 >
@@ -68,10 +76,11 @@ LLM 推理服务的崩溃续写网关：位于客户端和 OpenAI 兼容的推�
 接着往下生成，客户端看到的仍然是一条连续、完整的流式响应。
 
 前缀拼接方式由 `CONTINUATION_MODEL`（本部署实际 serve 的真实模型，不看请求里的 `model`
-字段）决定（见 `continuation_gateway/reconstruct.py`），内置 Kimi-K3（XTML）和通用
-`<think>...</think>` 两种格式，接入其它格式的模型只需要在那里加一个 builder。没有匹配到已验证
-模型的，按通用格式处理，并在启动时打一条 warning。vLLM 上部分模型（如 Qwen3.6-35B-A3B）在
-content-done 时会额外把 partial 消息拆成 `reasoning` / `content` 两个字段发送。
+字段）和 `CONTINUATION_ENGINE` 决定。默认是通用的 `<think>...</think>` 格式，部分模型有自己的
+格式（如 Kimi-K3 用 XTML），具体请参考 `continuation_gateway/reconstruct.py`，接入其它格式的模型
+只需要在那里加一个 builder。没有匹配到已验证模型的，按通用格式处理，并在启动时打一条 warning。
+vLLM 上部分模型（如 Qwen3.6-35B-A3B）在 content-done 时会额外把 partial 消息拆成
+`reasoning` / `content` 两个字段发送。
 
 ```
                                   leg1：原始请求
@@ -178,7 +187,7 @@ DOWNSTREAM_URL=http://<路由网关>:<port> CONTINUATION_MODEL=<真实模型名>
 `CONNECT_TIMEOUT_SECONDS`、`MAX_CONTINUATION_BODY_MB`、`MAX_REQUEST_BODY_MB`、
 `CJK_CHARS_PER_TOKEN`、`OTHER_CHARS_PER_TOKEN`。
 
-`DERENDER_BATCH_CHUNKS`（默认 `8`，最小 `1`）只对续写腿走 render-generate 的组合（vLLM + Kimi-K3）
+`DERENDER_BATCH_CHUNKS`（默认 `8`，最小 `1`）只对续写腿走 render-generate 的组合（如 vLLM + Kimi-K3）
 生效：这条腿依次对 `CONTINUATION_URL` 调用 render、tokenize、`/inference/v1/generate` 和
 derender，所以该地址必须同时暴露这四个端点（vLLM 服务端需要 `--enable-scale-out`）。derender
 每次调用都会重放此前生成的全部 token，因此生成的 chunk 要攒批，每 `DERENDER_BATCH_CHUNKS` 个调一次，

@@ -1,4 +1,7 @@
-"""vLLM + Kimi-K3 的续写腿（leg2）。Kimi-K3 的渲染器不认 continue_final_message，续写不能走
+"""vLLM 上 render-generate 路径的续写腿（leg2），用于 chat-continue 走不通的「引擎 + 模型」：
+Kimi-K3 的渲染器不认 continue_final_message；MiniMax-M2.7 的模板会把最后一条 assistant 消息里的
+`<think>R</think>` 拆出去，content-done 时 chat-continue 必然被引擎以 400 拒绝；Gemma-4 的模板会剥掉
+assistant content 里的 `<|channel>...<channel|>`，原生前缀同样被拒。续写不走
 /v1/chat/completions，改成四步：
 
 1. /v1/chat/completions/render：用原始请求渲染出 prompt 的 token id（带着原请求的
@@ -9,6 +12,13 @@
    content / tool_calls 的拆分由服务端的 parser 完成）。
 
 这条路径依赖 CONTINUATION_URL 指向的地址同时暴露上面四个端点（服务端需要 --enable-scale-out）。
+
+默认的通用处理（MiniMax-M2.7 等）：前缀只按 reasoning 是否为空拼 `R</think>C` / `R` / `C`（见
+reconstruct.build_render_prefix()），generate 的 token 按批直接送 derender，思考是开是关交给
+derender 的 parser 按完整 prompt 判断。需要专属处理的模型登记在 _SPECIAL_HANDLERS：
+- Kimi-K3：XTML 前缀要按 prompt 末尾的思考通道拼，送 derender 前要做标记尾部顺延（见下）；
+- Gemma-4：只有前缀是专属的（build_gemma4_render_prefix()，开头按请求判断要不要自己写
+  `<|channel>thought\n`，闭合用 `<channel|>`），送 derender 和通用处理一样每批直接送出。
 
 几处和 chat-continue 路径不同的设计：
 
@@ -21,7 +31,8 @@
   文本之间插空格，服务端 parser 对「标记只来了一半」的扣留是按精确前缀匹配的，带了空格就失配，
   半截标记会漏进 reasoning / content 而且撤不回来。所以每次送出前，若末尾是控制符 + 名字，就把这
   两个 token 留到下一次再送。只有送出的批尾有这个风险，批内部的标记在同一次解码里是完整的。
-  聚合和顺延是同一个送出算法，见 plan_flush()。
+  这是 Kimi-K3 专属的送出前处理（_K3Handler.hold_tail()，聚合加顺延见 plan_flush()），其它模型
+  不做。
 - 出口拆分：derender 一批 token 可能同时跨 reasoning、content、tool_calls，parser 会把它们合并
   成一个 delta；而流式 /v1/chat/completions 的一个 chunk 一次只带一种内容，所以网关按
   reasoning → content → tool_calls 的顺序拆成多个 chunk 再写给客户端，见 split_delta_chunk()。
@@ -29,7 +40,7 @@
   不为了算 token 数多调 /tokenize；差别只在 leg2 的 reasoning_tokens——chat-continue 路径直接信任续写腿
   上报的值，这条路径的 generate 和 derender 都不上报，所以改按 derender 输出的 reasoning 文本做字符估算。
   这条路径用到的 /tokenize 只有两类：每次续写把前缀文本编成 token id（接在 prompt 后面发给 generate，
-  这是 render-generate 本身需要的），以及首次使用时取 K3 控制 token 的 id（按 URL 和模型缓存）。
+  这是 render-generate 本身需要的），以及 Kimi-K3 首次使用时取控制 token 的 id（按 URL 和模型缓存）。
 """
 
 import asyncio
@@ -47,7 +58,16 @@ from aiohttp import (
 )
 
 from . import config
-from .reconstruct import XTML_CLOSE, XTML_OPEN, XTML_SEP, build_k3_render_prefix
+from .reconstruct import (
+    XTML_CLOSE,
+    XTML_OPEN,
+    XTML_SEP,
+    build_gemma4_render_prefix,
+    build_k3_render_prefix,
+    build_render_prefix,
+    gemma4_channel_prewritten,
+    match_key,
+)
 from .sse import REASONING_FIELDS, LineSplitter, StreamState
 from .usage import correct_usage, estimate_tokens, rewrite_chunk_fields
 
@@ -112,8 +132,8 @@ def plan_flush(pending: list, buffered: list, finish: bool,
                hold_tail: Callable[[list], int]) -> tuple:
     """一次送出：把上次顺延留下的 pending 和本批累计的 token 合在一起，返回 (这次要送去
     derender 的 token, 新的 pending)。finish 为真（结束 chunk）时全部送出，不再顺延；否则由
-    hold_tail 决定末尾留几个 token 到下一次。hold_tail 是模型相关的部分（K3 传 marker_tail_len
-    的闭包），其余逻辑和模型无关。"""
+    hold_tail 决定末尾留几个 token 到下一次。只有需要顺延的模型（Kimi-K3）走这里，hold_tail 是
+    _K3Handler.hold_tail。"""
     token_ids = pending + buffered
     if finish or not token_ids:
         return token_ids, []
@@ -239,11 +259,65 @@ async def get_k3_tokens(session: ClientSession, base: str, headers: dict, model:
     return k3
 
 
+class _K3Handler:
+    """Kimi-K3 的专属处理：前缀按 prompt 末尾的思考通道拼 XTML（build_k3_render_prefix()），送
+    derender 前做标记尾部顺延（marker_tail_len()）。"""
+
+    name = "kimi-k3"
+
+    def __init__(self, k3: K3Tokens):
+        self.k3 = k3
+
+    def build_prefix(self, prompt_head: list, payload: dict, reasoning: str, content: str) -> tuple:
+        """返回 (前缀文本, 日志里的补充说明)。"""
+        thinking_open = thinking_open_from_prompt(prompt_head, self.k3)
+        try:
+            prefix = build_k3_render_prefix(reasoning, content, thinking_open)
+        except ValueError as e:
+            raise RenderGenerateError("leg2_render_prefix_mismatch", str(e))
+        return prefix, f"thinking_open={thinking_open}"
+
+    def hold_tail(self, token_ids: list) -> int:
+        return marker_tail_len(token_ids, self.k3.marker_ids)
+
+
+async def _load_k3_handler(session: ClientSession, base: str, headers: dict, model: str) -> _K3Handler:
+    return _K3Handler(await get_k3_tokens(session, base, headers, model))
+
+
+class _Gemma4Handler:
+    """Gemma-4 的专属处理：只有前缀（build_gemma4_render_prefix()），开头要不要写
+    `<|channel>thought\n` 按原始请求判断（gemma4_channel_prewritten()）。送 derender 不做顺延，
+    和通用处理一样每批直接送出。"""
+
+    name = "gemma4"
+    hold_tail = None
+
+    def build_prefix(self, prompt_head: list, payload: dict, reasoning: str, content: str) -> tuple:
+        """返回 (前缀文本, 日志里的补充说明)。"""
+        prewritten = gemma4_channel_prewritten(payload)
+        return (build_gemma4_render_prefix(reasoning, content, prewritten),
+                f"channel_prewritten={prewritten}")
+
+
+async def _load_gemma4_handler(session: ClientSession, base: str, headers: dict, model: str) -> _Gemma4Handler:
+    return _Gemma4Handler()
+
+
+# 需要专属处理的模型 -> 加载函数，按 CONTINUATION_MODEL 匹配；没登记的模型走通用处理。
+_SPECIAL_HANDLERS = {
+    "kimi-k3": _load_k3_handler,
+    "gemma-4-26b-a4b-it": _load_gemma4_handler,
+    "gemma-4-31b-it": _load_gemma4_handler,
+}
+
+
 class _DerenderRelay:
-    """把 generate 的 token 按 plan_flush 的节奏送去 derender，再把结果拆分后写给客户端。"""
+    """把 generate 的 token 按批送去 derender，再把结果拆分后写给客户端。hold_tail 为 None（通用处理、
+    Gemma-4）时每批直接送出；模型有专属的送出前处理（Kimi-K3 的标记尾部顺延）时按 plan_flush 送出。"""
 
     def __init__(self, session: ClientSession, url: str, headers: dict, model: str, chat_request: dict,
-                 prompt_ids: list, hold_tail: Callable[[list], int], out: web.StreamResponse,
+                 prompt_ids: list, hold_tail: Optional[Callable[[list], int]], out: web.StreamResponse,
                  response_id: Optional[str], reasoning_field: Optional[str]):
         self.session = session
         self.url = url
@@ -273,8 +347,11 @@ class _DerenderRelay:
         return self.buffered_chunks >= config.DERENDER_BATCH_CHUNKS
 
     async def flush(self, finish_reason: Optional[str]) -> None:
-        to_send, self.pending = plan_flush(self.pending, self.buffered, finish_reason is not None,
-                                           self.hold_tail)
+        if self.hold_tail is None:
+            to_send = self.buffered
+        else:
+            to_send, self.pending = plan_flush(self.pending, self.buffered, finish_reason is not None,
+                                               self.hold_tail)
         self.buffered = []
         self.buffered_chunks = 0
         if not to_send and finish_reason is None:
@@ -337,12 +414,13 @@ async def run_render_generate(session: ClientSession, headers: dict, original_pa
     if not isinstance(prompt_head, list) or not prompt_head:
         raise RenderGenerateError("leg2_render_bad_response", "step=render: no token_ids")
 
-    k3 = await get_k3_tokens(session, base, json_headers, model)
-    thinking_open = thinking_open_from_prompt(prompt_head, k3)
-    try:
-        prefix = build_k3_render_prefix(state.reasoning, state.content, thinking_open)
-    except ValueError as e:
-        raise RenderGenerateError("leg2_render_prefix_mismatch", str(e))
+    load_handler = _SPECIAL_HANDLERS.get(match_key(config.CONTINUATION_MODEL, _SPECIAL_HANDLERS))
+    handler = await load_handler(session, base, json_headers, model) if load_handler else None
+    if handler is None:
+        prefix, detail = build_render_prefix(state.reasoning, state.content), "handler=default"
+    else:
+        prefix, detail = handler.build_prefix(prompt_head, original_payload, state.reasoning, state.content)
+        detail = f"handler={handler.name} {detail}"
     prefix_ids = await _tokenize(session, base, json_headers, model, prefix)
     prompt_ids = prompt_head + prefix_ids
 
@@ -355,8 +433,8 @@ async def run_render_generate(session: ClientSession, headers: dict, original_pa
     elif isinstance(sampling_params.get("max_tokens"), int):
         sampling_params["max_tokens"] = max(1, sampling_params["max_tokens"] - len(prefix_ids))
 
-    log.info("[continuation req=%s] render-generate: thinking_open=%s prompt_tokens=%d prefix_tokens=%d "
-             "max_tokens=%s", log_id, thinking_open, len(prompt_head), len(prefix_ids),
+    log.info("[continuation req=%s] render-generate: %s prompt_tokens=%d prefix_tokens=%d "
+             "max_tokens=%s", log_id, detail, len(prompt_head), len(prefix_ids),
              sampling_params.get("max_tokens"))
 
     generate_body = dict(rendered)
@@ -371,7 +449,7 @@ async def run_render_generate(session: ClientSession, headers: dict, original_pa
 
     relay = _DerenderRelay(
         session, base + "/v1/chat/completions/derender", json_headers, model, chat_request, prompt_ids,
-        lambda ids: marker_tail_len(ids, k3.marker_ids), out, state.response_id, state.reasoning_field)
+        handler.hold_tail if handler else None, out, state.response_id, state.reasoning_field)
     generated_ids = []
     generate_usage = None
     end_reason = "clean EOF"
